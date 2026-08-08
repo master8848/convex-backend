@@ -174,6 +174,7 @@ qdrant_segment = { git = "https://github.com/get-convex/qdrant", rev = "a5d1b7bc
 quote = "1.0"
 rand = "0.9"
 rand_chacha = "0.9.0"
+rand_core = "0.10"
 rc-zip = { version = "5", features = [ "deflate", "deflate64", "zstd" ] }
 ref-cast = "1.0.20"
 regex = "1"
@@ -264,6 +265,9 @@ value = { path = "crates/value" }
 vector = { path = "crates/vector" }
 vergen = { version = "8.1.0" }
 walkdir = "2"
+wasm_runner = { path = "crates/wasm_runner" }
+wasmtime = { version = "47.0.3", features = [ "async", "anyhow" ] }
+wasmtime-wasi = { version = "47.0.3", features = [ "p1" ] }
 xorf = { git = "https://github.com/sujayakar/xorf.git", rev = "62a32de47bb3ad8b34d6d4feac034a24be2c881a" }
 
 [profile.release]
