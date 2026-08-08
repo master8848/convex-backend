@@ -57,6 +57,16 @@ pub fn usage_deltas(events: &[UsageEvent]) -> Vec<(UsageLimitMetric, f64)> {
                                     ));
                                 }
                             },
+                            Ok(ModuleEnvironment::Wasm) => {
+                                deltas
+                                    .push((UsageLimitMetric::ActionComputeConvexGBHours, compute));
+                                if let Some(user_ms) = fields.user_execution_millis {
+                                    deltas.push((
+                                        UsageLimitMetric::ActionComputeCpuGBHours,
+                                        gb_s(fields.memory_megabytes, user_ms),
+                                    ));
+                                }
+                            },
                             Ok(ModuleEnvironment::Invalid) | Err(_) => {},
                         }
                     },

@@ -4337,6 +4337,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "async_lru",
+ "base64 0.13.1",
  "common",
  "convex_sync_types",
  "database",
@@ -4362,6 +4363,7 @@ dependencies = [
  "udf",
  "usage_tracking",
  "value",
+ "wasm_runner",
 ]
 
 [[package]]

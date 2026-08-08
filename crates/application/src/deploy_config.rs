@@ -1187,6 +1187,15 @@ impl TryFrom<ComponentDefinitionConfigJson> for ComponentDefinitionConfig {
                     ));
                 },
                 ModuleEnvironment::Invalid | ModuleEnvironment::Isolate => {},
+                ModuleEnvironment::Wasm => {
+                    anyhow::bail!(ErrorMetadata::bad_request(
+                        "WasmNotSupportedInComponents",
+                        format!(
+                            "WASM modules are not yet supported in components. Remove {}",
+                            module.path.as_str()
+                        )
+                    ));
+                },
             }
         }
         Ok(Self {

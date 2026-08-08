@@ -30,6 +30,7 @@ tracy-tracing = ["common/tracy-tracing"]
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 async-trait = { workspace = true }
 async_lru = { workspace = true }
 common = { workspace = true }
@@ -57,6 +58,7 @@ tokio-stream = { workspace = true }
 udf = { workspace = true }
 usage_tracking = { workspace = true }
 value = { workspace = true }
+wasm_runner = { workspace = true }
 
 [dev-dependencies]
 

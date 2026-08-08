@@ -44,3 +44,7 @@ value = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "udf_bench"
+harness = false

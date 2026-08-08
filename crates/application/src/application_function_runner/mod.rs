@@ -1627,6 +1627,76 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                     }
                 })
             },
+            ModuleEnvironment::Wasm => {
+                // Execute WASM actions through the function runner, which
+                // routes to the wasm execution path.
+                let outcome_future = async {
+                    let (_, outcome, _) = self
+                        .isolate_functions
+                        .function_runner
+                        .run_function(
+                            UdfType::Action,
+                            tx.identity().clone(),
+                            tx.begin_timestamp(),
+                            FunctionWrites {
+                                updates: tx
+                                    .writes()
+                                    .as_flat()?
+                                    .coalesced_writes()
+                                    .cloned()
+                                    .collect(),
+                            },
+                            Some(log_line_sender),
+                            Some(FunctionMetadata {
+                                path_and_args,
+                                journal: QueryJournal::new(),
+                            }),
+                            None,
+                            self.default_system_env_vars.clone(),
+                            self.database
+                                .snapshot(tx.begin_timestamp())?
+                                .in_memory_indexes
+                                .in_memory_indexes_last_modified(),
+                            context.clone(),
+                        )
+                        .await?;
+                    let outcome: udf::ActionOutcome = match outcome {
+                        FunctionOutcome::Action(outcome) => outcome,
+                        _ => anyhow::bail!("WASM action returned an invalid outcome"),
+                    };
+                    Ok::<_, anyhow::Error>(ValidatedActionOutcome::new(
+                        outcome,
+                        returns_validator,
+                        &table_mapping,
+                    ))
+                }
+                .boxed();
+                let (outcome_result, log_lines) = run_function_and_collect_log_lines(
+                    outcome_future,
+                    log_line_receiver,
+                    |log_line| {
+                        self.function_log.log_action_progress(
+                            path.clone().for_logging(),
+                            unix_timestamp,
+                            context.clone(),
+                            vec![log_line].into(),
+                            module.environment,
+                        )
+                    },
+                )
+                .await;
+                timer.finish();
+                outcome_result.map(|outcome| ActionCompletion {
+                    outcome,
+                    execution_time: start.elapsed(),
+                    environment: ModuleEnvironment::Wasm,
+                    memory_in_mb: 0,
+                    context: context.clone(),
+                    unix_timestamp,
+                    caller: caller.clone(),
+                    log_lines,
+                })
+            },
             ModuleEnvironment::Invalid => {
                 Err(anyhow::anyhow!("Attempting to run an invalid function"))
             },
@@ -1652,6 +1722,7 @@ impl<RT: Runtime> ApplicationFunctionRunner<RT> {
                             .unwrap(),
                         // This isn't correct but we don't have a value to use here.
                         ModuleEnvironment::Node => 0,
+                        ModuleEnvironment::Wasm => 0,
                         ModuleEnvironment::Invalid => 0,
                     },
                     context,

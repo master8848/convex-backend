@@ -9,10 +9,12 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
+
 use common::{
     auth::AuthConfig,
     bootstrap_model::components::definition::ComponentDefinitionMetadata,
     components::{
+        CanonicalizedComponentModulePath,
         ComponentDefinitionPath,
         ComponentName,
         Resource,
@@ -67,10 +69,17 @@ use model::{
         EnvVarName,
         EnvVarValue,
     },
-    modules::module_versions::{
-        AnalyzedModule,
-        ModuleSource,
-        SourceMap,
+    modules::{
+        module_versions::{
+            AnalyzedModule,
+            ModuleSource,
+            SourceMap,
+        },
+        ModuleModel,
+    },
+    source_packages::{
+        upload_download::download_package,
+        SourcePackageModel,
     },
     udf_config::types::UdfConfig,
 };
@@ -93,10 +102,17 @@ use udf::{
         ValidatedPathAndArgs,
     },
     ActionCallbacks,
+    ActionOutcome,
     EvaluateAppDefinitionsResult,
     FunctionOutcome,
     HttpActionRequest as HttpActionRequestInner,
     HttpActionResponseStreamer,
+    SyscallTrace,
+    UdfOutcome,
+};
+use value::{
+    JsonPackedValue,
+    MAX_COMMIT_TS,
 };
 use usage_tracking::{
     FunctionUsageStats,
@@ -189,6 +205,7 @@ pub struct FunctionRunnerCore<RT: Runtime, S: StorageForDeployment<RT>> {
     module_cache: ModuleCache<RT>,
     code_cache: CodeCache,
     isolate_client: IsolateClient<RT>,
+    wasm_runner: Arc<wasm_runner::WasmRunner>,
 }
 
 impl<RT: Runtime, S: StorageForDeployment<RT>> Clone for FunctionRunnerCore<RT, S> {
@@ -200,6 +217,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> Clone for FunctionRunnerCore<RT, 
             module_cache: self.module_cache.clone(),
             code_cache: self.code_cache.clone(),
             isolate_client: self.isolate_client.clone(),
+            wasm_runner: self.wasm_runner.clone(),
         }
     }
 }
@@ -241,6 +259,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         let index_cache = InMemoryIndexCache::new(rt.clone());
         let module_cache = ModuleCache::new(rt.clone());
         let code_cache = CodeCache::new();
+        let wasm_runner = Arc::new(wasm_runner::WasmRunner::new()?);
 
         Ok(Self {
             rt,
@@ -249,6 +268,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             module_cache,
             code_cache,
             isolate_client,
+            wasm_runner,
         })
     }
 
@@ -352,7 +372,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 deployment_name: deployment_name.clone(),
                 cache: self.module_cache.clone(),
                 code_cache: self.code_cache.clone(),
-                modules_storage,
+                modules_storage: modules_storage.clone(),
             }),
             deployment,
         };
@@ -368,6 +388,37 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 // system-generated input.
                 let rng_seed = self.rt.rng().random();
                 let unix_timestamp = self.rt.unix_timestamp();
+                // Route WASM modules to the wasm runner before touching the
+                // isolate.
+                if self
+                    .module_environment(&mut transaction, path_and_args.path())
+                    .await?
+                    == ModuleEnvironment::Wasm
+                {
+                    let (tx, outcome) = self
+                        .execute_wasm_udf(
+                            udf_type,
+                            path_and_args,
+                            transaction,
+                            rng_seed,
+                            unix_timestamp,
+                            log_line_sender,
+                            modules_storage,
+                        )
+                        .await?;
+                    let outcome = match udf_type {
+                        UdfType::Query => FunctionOutcome::Query(outcome),
+                        UdfType::Mutation => FunctionOutcome::Mutation(outcome),
+                        UdfType::Action | UdfType::HttpAction => {
+                            anyhow::bail!("WASM functions do not support {udf_type:?} here")
+                        },
+                    };
+                    return Ok((
+                        Some(tx.try_into()?),
+                        outcome,
+                        usage_tracker.gather_user_stats(),
+                    ));
+                }
                 let (tx, outcome) = self
                     .isolate_client
                     .execute_udf(
@@ -396,6 +447,62 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     function_metadata.context("Missing function metadata for action")?;
                 let log_line_sender =
                     log_line_sender.context("Missing log line sender for action")?;
+                if self
+                    .module_environment(&mut transaction, path_and_args.path())
+                    .await?
+                    == ModuleEnvironment::Wasm
+                {
+                    let rng_seed = self.rt.rng().random();
+                    let unix_timestamp = self.rt.unix_timestamp();
+                    let (path, arguments, npm_version) = path_and_args.consume();
+                    let identity = transaction.inert_identity();
+                    let wasm_binary = self
+                        .fetch_wasm_binary(&mut transaction, &path, modules_storage)
+                        .await?;
+                    let function_name = path.udf_path.function_name().to_string();
+                    let args_json = arguments.get().to_string();
+                    let (_, result) = wasm_runner::run_wasm_udf(
+                        &self.wasm_runner,
+                        &wasm_binary,
+                        wasm_runner::WasmInput {
+                            function_name,
+                            args_json,
+                        },
+                        transaction,
+                        path.component,
+                        rng_seed,
+                        unix_timestamp,
+                        wasm_runner::WasmLimits::default(),
+                        /* allow_unresolved_commit_ts */ false,
+                        Some(log_line_sender),
+                    )
+                    .await?;
+                    let action_result = result.result.and_then(|packed| {
+                        let pending = packed
+                            .unpack()
+                            .map_err(|e| JsError::from_message(e.to_string()))?;
+                        let value = pending
+                            .resolve(MAX_COMMIT_TS)
+                            .map_err(|e| JsError::from_message(e.to_string()))?
+                            .into_owned();
+                        Ok(JsonPackedValue::pack(value))
+                    });
+                    let outcome = ActionOutcome {
+                        path: path.for_logging(),
+                        arguments,
+                        identity,
+                        unix_timestamp,
+                        result: action_result,
+                        syscall_trace: SyscallTrace::new(),
+                        udf_server_version: npm_version,
+                        user_execution_time: None,
+                    };
+                    return Ok((
+                        None,
+                        FunctionOutcome::Action(outcome),
+                        usage_tracker.gather_user_stats(),
+                    ));
+                }
                 let outcome = self
                     .isolate_client
                     .execute_action(
@@ -455,6 +562,133 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 ))
             },
         }
+    }
+
+    /// Fetch the module environment for the module containing the given
+    /// function path.
+    async fn module_environment(
+        &self,
+        transaction: &mut Transaction<RT>,
+        path: &common::components::ResolvedComponentFunctionPath,
+    ) -> anyhow::Result<ModuleEnvironment> {
+        let module_path = CanonicalizedComponentModulePath {
+            component: path.component,
+            module_path: path.udf_path.module().clone(),
+        };
+        let Some(metadata) = ModuleModel::new(transaction)
+            .get_metadata(module_path)
+            .await?
+        else {
+            anyhow::bail!(
+                "Trying to execute {:?} but its module is not found",
+                path.udf_path
+            );
+        };
+        Ok(metadata.environment)
+    }
+
+    /// Fetch the wasm binary for a module and execute a UDF in it.
+    ///
+    /// The module's source, as stored in the source package, is a base64
+    /// encoding of the wasm binary. See `docs/wasm.md` for the deployment
+    /// contract.
+    async fn fetch_wasm_binary(
+        &self,
+        transaction: &mut Transaction<RT>,
+        path: &common::components::ResolvedComponentFunctionPath,
+        modules_storage: Arc<dyn Storage>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let component = path.component;
+        let module_path = CanonicalizedComponentModulePath {
+            component,
+            module_path: path.udf_path.module().clone(),
+        };
+        let Some(metadata) = ModuleModel::new(transaction)
+            .get_metadata(module_path)
+            .await?
+        else {
+            anyhow::bail!(
+                "Trying to execute {:?} but its module is not found",
+                path.udf_path
+            );
+        };
+        anyhow::ensure!(
+            metadata.environment == ModuleEnvironment::Wasm,
+            "Trying to execute {:?} as a WASM module, but it is bundled for {:?}",
+            path.udf_path,
+            metadata.environment,
+        );
+        let source_package = SourcePackageModel::new(transaction, component.into())
+            .get(metadata.source_package_id)
+            .await?;
+        let modules = download_package(modules_storage, &source_package).await?;
+        let module_path: CanonicalizedModulePath = path.udf_path.module().clone();
+        let module = modules
+            .get(&module_path)
+            .with_context(|| format!("Module {:?} not found in source package", module_path))?;
+        let module_source: &str = module.source.as_ref();
+        let wasm_bytes = base64::decode(module_source.trim())
+            .context("WASM module source is not valid base64")?;
+        Ok(wasm_bytes)
+    }
+
+    /// Execute a UDF from a WASM module.
+    async fn execute_wasm_udf(
+        &self,
+        udf_type: UdfType,
+        path_and_args: ValidatedPathAndArgs,
+        transaction: Transaction<RT>,
+        rng_seed: [u8; 32],
+        unix_timestamp: UnixTimestamp,
+        log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
+        modules_storage: Arc<dyn Storage>,
+    ) -> anyhow::Result<(Transaction<RT>, UdfOutcome)> {
+        let (path, arguments, npm_version) = path_and_args.consume();
+        let identity = transaction.inert_identity();
+        let mut transaction = transaction;
+        let wasm_binary = self
+            .fetch_wasm_binary(&mut transaction, &path, modules_storage)
+            .await?;
+        let function_name = path
+            .udf_path
+            .function_name()
+            .to_string();
+        let args_json = arguments.get().to_string();
+        let (transaction, result) = wasm_runner::run_wasm_udf(
+            &self.wasm_runner,
+            &wasm_binary,
+            wasm_runner::WasmInput {
+                function_name,
+                args_json,
+            },
+            transaction,
+            path.component,
+            rng_seed,
+            unix_timestamp,
+            wasm_runner::WasmLimits::default(),
+            /* allow_unresolved_commit_ts */ udf_type == UdfType::Mutation,
+            log_line_sender,
+        )
+        .await?;
+        let outcome = UdfOutcome {
+            path: path.for_logging(),
+            arguments,
+            identity,
+            observed_identity: false,
+            rng_seed,
+            observed_rng: result.observed_rng,
+            unix_timestamp,
+            observed_time: result.observed_time,
+            log_lines: result.log_lines,
+            journal: QueryJournal::new(),
+            audit_log_lines: Default::default(),
+            result: result.result,
+            syscall_trace: SyscallTrace::new(),
+            udf_server_version: npm_version,
+            memory_in_mb: 0,
+            user_execution_time: None,
+        };
+        Ok((transaction, outcome))
     }
 
     pub async fn analyze(
