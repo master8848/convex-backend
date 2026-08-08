@@ -42,6 +42,33 @@ use wasm_runner::{
     WasmRunner,
 };
 
+/// Builds the Go guest fixture and returns the compiled wasm bytes.
+/// Requires the Go toolchain. Returns None if `go` is not installed.
+fn build_go_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/go_guest",
+    );
+    let output = std::process::Command::new("go")
+        .args(["build", "-buildmode=c-shared", "-o", "go_guest.wasm", "."])
+        .current_dir(dir)
+        .env("GOOS", "wasip1")
+        .env("GOARCH", "wasm")
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("Failed to run go to build the guest module"),
+    };
+    anyhow::ensure!(
+        output.status.success(),
+        "go build failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let wasm_path = format!("{dir}/go_guest.wasm");
+    std::fs::read(wasm_path).context("Go guest module binary not found").map(Some)
+}
+
 /// Builds the guest fixture crate and returns the compiled wasm bytes.
 /// Requires cargo and the wasm32-wasip1 target to be installed.
 fn build_guest_module() -> anyhow::Result<Vec<u8>> {
@@ -74,8 +101,18 @@ fn build_guest_module() -> anyhow::Result<Vec<u8>> {
 }
 
 /// Create an empty database with a fresh sqlite persistence layer.
-async fn new_database(rt: &ProdRuntime) -> anyhow::Result<Database<ProdRuntime>> {
+async fn new_database(
+    rt: &ProdRuntime,
+) -> anyhow::Result<(Arc<dyn Persistence>, Database<ProdRuntime>)> {
     let persistence: Arc<dyn Persistence> = Arc::new(SqlitePersistence::new(":memory:")?);
+    let database = load_database(rt, persistence.clone()).await?;
+    Ok((persistence, database))
+}
+
+async fn load_database(
+    rt: &ProdRuntime,
+    persistence: Arc<dyn Persistence>,
+) -> anyhow::Result<Database<ProdRuntime>> {
     let searcher: Arc<dyn Searcher> = Arc::new(SearcherStub);
     let (shutdown_tx, _) = tokio::sync::oneshot::channel::<anyhow::Error>();
     let shutdown = ShutdownSignal::new(shutdown_tx);
@@ -97,7 +134,12 @@ async fn new_database(rt: &ProdRuntime) -> anyhow::Result<Database<ProdRuntime>>
 }
 
 /// Create a user table and commit it.
-async fn create_table(database: &Database<ProdRuntime>, name: &str) -> anyhow::Result<()> {
+async fn create_table(
+    database: &Database<ProdRuntime>,
+    persistence: &Arc<dyn Persistence>,
+    rt: &ProdRuntime,
+    name: &str,
+) -> anyhow::Result<Database<ProdRuntime>> {
     let identity = Identity::Unknown(None);
     let mut tx = database.begin(identity.clone()).await?;
     let table_name: TableName = name.parse()?;
@@ -107,7 +149,8 @@ async fn create_table(database: &Database<ProdRuntime>, name: &str) -> anyhow::R
     database
         .commit_with_write_source(tx, database::WriteSource::System("test"))
         .await?;
-    Ok(())
+    // Reload so the table count snapshot includes the new table.
+    load_database(rt, persistence.clone()).await
 }
 
 /// Run a function in a fresh transaction against the given database.
@@ -146,9 +189,9 @@ fn test_rust_guest_end_to_end() -> anyhow::Result<()> {
         let module_binary = build_guest_module()?;
         let runner = WasmRunner::new()?;
         let rt = ProdRuntime::new(&tokio);
-        let database = new_database(&rt).await?;
-        create_table(&database, "users").await?;
-        create_table(&database, "counters").await?;
+        let (persistence, mut database) = new_database(&rt).await?;
+        database = create_table(&database, &persistence, &rt, "users").await?;
+        database = create_table(&database, &persistence, &rt, "counters").await?;
 
         // echo: argument deserialization + result serialization.
         let (_, result) = run_function(
@@ -322,6 +365,109 @@ fn test_rust_guest_end_to_end() -> anyhow::Result<()> {
         assert!(functions
             .iter()
             .all(|f| matches!(f.function_type.as_str(), "query" | "mutation")));
+
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn test_go_guest_end_to_end() -> anyhow::Result<()> {
+    let tokio = ProdRuntime::init_tokio()?;
+    tokio.block_on(async {
+        let Some(module_binary) = build_go_guest_module()? else {
+            eprintln!("go not found; skipping Go guest test");
+            return anyhow::Ok(());
+        };
+        let runner = WasmRunner::new()?;
+        let rt = ProdRuntime::new(&tokio);
+        let (persistence, mut database) = new_database(&rt).await?;
+        database = create_table(&database, &persistence, &rt, "counters").await?;
+
+        // Go's runtime requires _initialize before any export; the runner
+        // handles that internally.
+
+        // echo
+        let (_, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "echo",
+            serde_json::json!(["go hello"]),
+        )
+        .await?;
+        let value: PendingValue = result.result?.unpack()?;
+        assert_eq!(
+            value.to_uncommitted_json(),
+            serde_json::json!("go hello"),
+        );
+
+        // add (with virtual time)
+        let (_, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "add",
+            serde_json::json!([2.0, 3.0]),
+        )
+        .await?;
+        let value: PendingValue = result.result?.unpack()?;
+        assert_eq!(
+            value.to_uncommitted_json(),
+            serde_json::json!(1_700_000_000_005.0),
+        );
+
+        // mutation: bump commits a write to the counters table
+        let (tx, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "bump",
+            serde_json::json!([]),
+        )
+        .await?;
+        let value: PendingValue = result.result?.unpack()?;
+        assert_eq!(value.to_uncommitted_json(), serde_json::json!(1.0));
+        database
+            .commit_with_write_source(tx, database::WriteSource::System("test"))
+            .await?;
+
+        // deterministic randomness
+        let (_, a) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "random",
+            serde_json::json!([]),
+        )
+        .await?;
+        let (_, b) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "random",
+            serde_json::json!([]),
+        )
+        .await?;
+        let av: PendingValue = a.result?.unpack()?;
+        let bv: PendingValue = b.result?.unpack()?;
+        assert_eq!(av.to_uncommitted_json(), bv.to_uncommitted_json());
+
+        // descriptor analysis
+        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let tx = database.begin(Identity::Unknown(None)).await?;
+        let functions = wasm_runner::analyze_functions(
+            &runner,
+            &module,
+            tx,
+            ComponentId::Root,
+            [7u8; 32],
+            UnixTimestamp::from_millis(1_700_000_000_000),
+            WasmLimits::default(),
+        )
+        .await?;
+        let names: Vec<_> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"echo"));
+        assert!(names.contains(&"bump"));
 
         anyhow::Ok(())
     })

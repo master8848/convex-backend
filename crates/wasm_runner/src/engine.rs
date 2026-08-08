@@ -74,6 +74,8 @@ use crate::{
 
 /// The maximum number of compiled modules kept in memory.
 const MAX_CACHED_MODULES: usize = 128;
+/// The reactor initialization export used by Go guests.
+const INITIALIZE: &str = "_initialize";
 /// The maximum number of log lines captured per invocation, matching the
 /// isolate path.
 const MAX_LOG_LINES: usize = 256;
@@ -469,7 +471,7 @@ pub(crate) async fn execute_module<RT: Runtime>(
     store.fuel_async_yield_interval(Some(1_000_000))?;
 
     let mut linker = Linker::new(&runner.engine);
-    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostContext| &mut state.wasi)
+    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostContext| &mut state.wasi)
         .map_err(|e| anyhow::anyhow!("registering WASI: {e}"))?;
     register_sync_host_functions(&mut linker)?;
     register_db_host_functions(&mut linker, &shared)?;
@@ -478,6 +480,14 @@ pub(crate) async fn execute_module<RT: Runtime>(
         .instantiate_async(&mut store, module)
         .await
         .map_err(|e| anyhow::anyhow!("Instantiating WASM module: {e}"))?;
+    // Go guests (and other reactor-style runtimes) require `_initialize` to
+    // be called once before any export.
+    if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, INITIALIZE) {
+        tokio::time::timeout(limits.timeout, initialize.call_async(&mut store, ()))
+            .await
+            .context("Timed out initializing WASM module")?
+            .map_err(|e| anyhow::anyhow!("WASM module initialization failed: {e}"))?;
+    }
     let run: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, GUEST_RUN)
         .map_err(|e| anyhow::anyhow!("Missing __convex_run export: {e}"))?;
@@ -597,7 +607,7 @@ pub async fn analyze_functions<RT: Runtime>(
     store.set_fuel(limits.fuel)?;
     store.fuel_async_yield_interval(Some(1_000_000))?;
     let mut linker = Linker::new(&runner.engine);
-    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |state: &mut HostContext| &mut state.wasi)
+    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostContext| &mut state.wasi)
         .map_err(|e| anyhow::anyhow!("registering WASI: {e}"))?;
     register_sync_host_functions(&mut linker)?;
     let shared = Arc::new(DbShared::<RT> {
@@ -608,6 +618,12 @@ pub async fn analyze_functions<RT: Runtime>(
     });
     register_db_host_functions(&mut linker, &shared)?;
     let instance = linker.instantiate_async(&mut store, module).await?;
+    if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, INITIALIZE) {
+        tokio::time::timeout(limits.timeout, initialize.call_async(&mut store, ()))
+            .await
+            .context("Timed out initializing WASM module")?
+            .map_err(|e| anyhow::anyhow!("WASM module initialization failed: {e}"))?;
+    }
     let functions: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, GUEST_FUNCTIONS)
         .map_err(|e| anyhow::anyhow!("Missing __convex_functions export: {e}"))?;
