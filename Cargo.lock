@@ -2489,6 +2489,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "convex_sdk"
+version = "0.1.0"
+dependencies = [
+ "convex_sdk_macros",
+ "pollster",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "convex_sdk_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "convex_sync_types"
 version = "0.10.4"
 dependencies = [
@@ -7893,6 +7912,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "pollster"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f3a9f18d041e6d0e102a0a46750538147e5e8992d3b4873aaafee2520b00ce3"
+
+[[package]]
 name = "portable-atomic"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12374,12 +12399,16 @@ dependencies = [
  "database",
  "errors",
  "futures",
+ "indexing",
+ "keybroker",
  "rand_chacha 0.10.0",
  "rand_core 0.10.0",
  "runtime",
+ "search",
  "serde",
  "serde_json",
  "sha2 0.10.8",
+ "sqlite",
  "storage",
  "tokio",
  "tracing",

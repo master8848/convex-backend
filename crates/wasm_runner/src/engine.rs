@@ -291,14 +291,9 @@ fn register_sync_host_functions(linker: &mut Linker<HostContext>) -> Result<(), 
         HOST_FN_MODULE,
         OUTPUT_SET,
         |mut caller: Caller<'_, HostContext>, ptr: i32, len: i32| -> Result<(), wasmtime::Error> {
-            let (ptr, len) = checked_range(ptr, len, call_data_len(&caller))
-                .ok_or_else(|| wasmtime::Error::msg("__convex_output_set out of bounds"))?;
-            let call_data = caller.data().call_data.clone();
-            let guard = call_data
-                .lock()
-                .map_err(|_| wasmtime::Error::msg("call data poisoned"))?;
-            let bytes = guard[ptr..ptr + len].to_vec();
-            drop(guard);
+            // The output lives in guest memory; copy it out synchronously so
+            // pointers never dangle after the call returns.
+            let bytes = HostContext::read_guest(&mut caller, ptr, len)?;
             caller.data_mut().output = Some(bytes);
             Ok(())
         },
@@ -308,14 +303,7 @@ fn register_sync_host_functions(linker: &mut Linker<HostContext>) -> Result<(), 
         HOST_FN_MODULE,
         ERROR_SET,
         |mut caller: Caller<'_, HostContext>, ptr: i32, len: i32| -> Result<(), wasmtime::Error> {
-            let (ptr, len) = checked_range(ptr, len, call_data_len(&caller))
-                .ok_or_else(|| wasmtime::Error::msg("__convex_error_set out of bounds"))?;
-            let call_data = caller.data().call_data.clone();
-            let guard = call_data
-                .lock()
-                .map_err(|_| wasmtime::Error::msg("call data poisoned"))?;
-            let bytes = guard[ptr..ptr + len].to_vec();
-            drop(guard);
+            let bytes = HostContext::read_guest(&mut caller, ptr, len)?;
             caller.data_mut().error = Some(bytes);
             Ok(())
         },
@@ -487,7 +475,8 @@ pub(crate) async fn execute_module<RT: Runtime>(
     register_db_host_functions(&mut linker, &shared)?;
 
     let instance = linker
-        .instantiate(&mut store, module)
+        .instantiate_async(&mut store, module)
+        .await
         .map_err(|e| anyhow::anyhow!("Instantiating WASM module: {e}"))?;
     let run: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, GUEST_RUN)
@@ -618,7 +607,7 @@ pub async fn analyze_functions<RT: Runtime>(
         max_call_data: limits.max_call_data,
     });
     register_db_host_functions(&mut linker, &shared)?;
-    let instance = linker.instantiate(&mut store, module)?;
+    let instance = linker.instantiate_async(&mut store, module).await?;
     let functions: TypedFunc<(), i32> = instance
         .get_typed_func(&mut store, GUEST_FUNCTIONS)
         .map_err(|e| anyhow::anyhow!("Missing __convex_functions export: {e}"))?;

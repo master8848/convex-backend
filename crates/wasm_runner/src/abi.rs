@@ -26,9 +26,10 @@
 //! - `__convex_alloc(len: i32) -> i32` (offset into call data)
 //! - `__convex_call_data_load(offset: i32, dest: i32, len: i32)`
 //!
-//! Result reporting:
-//! - `__convex_output_set(ptr: i32, len: i32)` (result bytes in call data)
-//! - `__convex_error_set(ptr: i32, len: i32)` (error bytes in call data)
+//! Result reporting (the output/error buffers live in guest memory; the host
+//! copies them out when set):
+//! - `__convex_output_set(ptr: i32, len: i32)` (guest memory)
+//! - `__convex_error_set(ptr: i32, len: i32)` (guest memory)
 //!
 //! Utilities:
 //! - `__convex_log(ptr: i32, len: i32)`

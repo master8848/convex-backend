@@ -1,0 +1,15 @@
+[package]
+name = "convex_sdk"
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-FSL-1.1-Apache-2.0"
+description = "Rust SDK for writing Convex backend functions that run as WebAssembly"
+
+[dependencies]
+convex_sdk_macros = { path = "../convex_sdk_macros" }
+pollster = "0.4"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

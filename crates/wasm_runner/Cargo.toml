@@ -34,7 +34,11 @@ wasmtime-wasi = { workspace = true }
 common = { workspace = true, features = ["testing"] }
 database = { workspace = true, features = ["testing"] }
 errors = { workspace = true, features = ["testing"] }
-runtime = { workspace = true, features = ["testing"] }
+indexing = { workspace = true, features = ["testing"] }
+keybroker = { workspace = true, features = ["testing"] }
+runtime = { workspace = true }
+search = { workspace = true, features = ["testing"] }
+sqlite = { workspace = true }
 storage = { workspace = true, features = ["testing"] }
 value = { workspace = true, features = ["testing"] }
 
