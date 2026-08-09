@@ -3252,6 +3252,7 @@ dependencies = [
  "shape_inference",
  "short_future",
  "slab",
+ "sqlite",
  "storage",
  "table_iteration",
  "tokio",

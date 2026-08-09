@@ -105,6 +105,7 @@ roles = { workspace = true, features = ["testing"] }
 runtime = { workspace = true, features = ["testing"] }
 search = { workspace = true, features = ["testing"] }
 shape_inference = { workspace = true, features = ["testing"] }
+sqlite = { workspace = true }
 storage = { workspace = true, features = ["testing"] }
 table_iteration = { workspace = true, features = ["testing"] }
 usage_tracking = { workspace = true, features = ["testing"] }
@@ -114,6 +115,10 @@ vector = { workspace = true, features = ["testing"] }
 [[bench]]
 name = "subscriptions"
 harness = false
+required-features = ["testing"]
+
+[[test]]
+name = "dedup_subscriptions"
 required-features = ["testing"]
 
 [[bench]]

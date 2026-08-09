@@ -2078,6 +2078,12 @@ impl<RT: Runtime> Database<RT> {
         self.subscriptions.subscribe(token, false)
     }
 
+    #[cfg(feature = "testing")]
+    /// Number of deduplicated subscription entries (test helper).
+    pub fn test_subscriptions_shared_len(&self) -> usize {
+        self.subscriptions.test_shared_len()
+    }
+
     pub async fn subscribe_and_wait_for_invalidation(
         &self,
         token: Token,

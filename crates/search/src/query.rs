@@ -582,7 +582,7 @@ impl QueryResults {
 /// A single text query will be split into many parts (tokenized), each part
 /// will be combined with the constant metadata (path, distance prefix etc) into
 /// a term, then we track reads based on individual terms.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TextQueryTermRead {
     pub field_path: FieldPath,
     pub term: TextQueryTerm,
@@ -598,14 +598,10 @@ impl TextQueryTermRead {
 // that we approximately match what the tokenzier we're using allows. The
 // would already have run on these terms prior to this point for production
 // code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TextQueryTerm {
-    Exact(
-        String,
-    ),
-    Prefix(
-        String,
-    ),
+    Exact(String),
+    Prefix(String),
 }
 
 impl TextQueryTerm {
@@ -634,7 +630,7 @@ impl HeapSize for TextQueryTermRead {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FilterConditionRead {
     Must(FieldPath, FilterValue),
 }

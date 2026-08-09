@@ -593,7 +593,7 @@ const UNDEFINED_TAG: u8 = 0x1;
 
 /// A bytes representation of a value in a document that we filter on with a
 /// must clause.
-#[derive(Debug, Clone, PartialEq, Eq, From, Into)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, From, Into)]
 pub struct FilterValue(Vec<u8>);
 
 impl FilterValue {

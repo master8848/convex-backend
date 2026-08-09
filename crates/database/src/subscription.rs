@@ -3,12 +3,18 @@
 
 use std::{
     collections::{
+        hash_map::DefaultHasher,
         BTreeMap,
         HashMap,
     },
     future::Future,
+    hash::{
+        Hash,
+        Hasher,
+    },
     sync::{
         atomic::{
+            AtomicBool,
             AtomicI64,
             AtomicUsize,
             Ordering,
@@ -58,6 +64,8 @@ use interval_map::IntervalMap;
 use parking_lot::Mutex;
 use prometheus::VMHistogram;
 use search::query::{
+    FilterConditionRead,
+    TextQueryTermRead,
     TextSearchSubscription,
     TextSearchSubscriptions,
 };
@@ -67,6 +75,7 @@ use tokio::sync::{
         self,
         error::TrySendError,
     },
+    oneshot,
     watch,
 };
 use value::TabletId;
@@ -126,8 +135,12 @@ impl InvalidationMetricCallback {
 
 type Sequence = usize;
 
+/// Identifies a subscription entry within a `SubscriptionManager`. The `seq`
+/// guards against stale releases after an entry was invalidated and
+/// re-created: a release whose `seq` no longer matches the current entry is a
+/// no-op.
 #[derive(Clone, Copy, Debug)]
-struct SubscriptionKey {
+pub struct SubscriptionKey {
     id: SubscriberId,
     seq: Sequence,
 }
@@ -138,6 +151,10 @@ pub struct SubscriptionsClient {
     log: LogReader,
     senders: Vec<mpsc::Sender<SubscriptionRequest>>,
     next_manager: Arc<AtomicUsize>,
+    // Deduplicates identical subscriptions across all clients: many clients
+    // watching the same query share a single manager entry (one ReadSet, one
+    // interval-map footprint) instead of each keeping their own copy.
+    shared: Arc<Mutex<HashMap<DedupKey, Arc<SharedSubscriptionEntry>>>>,
 }
 
 impl SubscriptionsClient {
@@ -146,31 +163,95 @@ impl SubscriptionsClient {
             Ok(t) => t,
             Err(invalid_ts) => return Ok(Subscription::invalid(invalid_ts)),
         };
-        let (subscription, sender) = Subscription::new(&token);
-        let request = SubscriptionRequest {
-            token,
-            sender,
-            is_system,
-        };
-        // Increment the counter first to avoid underflow
-        metrics::log_subscription_queue_length_delta(1);
+        // Try to dedup with an existing identical subscription first.
+        let key = (reads_digest(token.reads()), token.ts(), is_system);
+        let entry = {
+            let mut shared = self.shared.lock();
+            match shared.get(&key).filter(|e| !e.is_invalid()) {
+                Some(entry) => entry.clone(),
+                None => {
+                    let manager_idx =
+                        self.next_manager.fetch_add(1, Ordering::Relaxed) % self.senders.len();
+                    let (validity, valid_tx, valid_rx) = Subscription::new_parts(&token);
+                    let entry = Arc::new(SharedSubscriptionEntry {
+                        key,
+                        validity,
+                        valid_rx,
+                        // Client handles increment this; the last drop (to 0)
+                        // releases the manager entry.
+                        users: Arc::new(AtomicUsize::new(0)),
+                        subscription_key: Arc::new(Mutex::new(None)),
+                        release_pending: Arc::new(AtomicBool::new(false)),
+                        invalid: Arc::new(AtomicBool::new(false)),
+                        release_tx: self.senders[manager_idx].clone(),
+                        shared: self.shared.clone(),
+                    });
+                    // Watch for invalidation of the underlying subscription so
+                    // the stale entry is evicted from the dedup map and future
+                    // subscribes with the same key create a fresh one.
+                    let watcher_entry = Arc::downgrade(&entry);
+                    let mut watcher = entry.valid_rx.clone();
+                    tokio::spawn(async move {
+                        let _ = watcher
+                            .wait_for(|state| matches!(state, SubscriptionState::Invalid))
+                            .await;
+                        if let Some(entry) = watcher_entry.upgrade() {
+                            entry.mark_invalid();
+                        }
+                    });
+                    let (_, sender) = Subscription::new_from_parts(
+                        entry.validity.clone(),
+                        valid_tx,
+                        entry.valid_rx.clone(),
+                    );
+                    let (response_tx, response_rx) = oneshot::channel();
+                    let request = SubscriptionRequest::Subscribe {
+                        token,
+                        sender,
+                        is_system,
+                        response: response_tx,
+                    };
+                    // Increment the counter first to avoid underflow
+                    metrics::log_subscription_queue_length_delta(1);
 
-        // Round-robin selection of manager to handle this subscription
-        let manager_idx = self.next_manager.fetch_add(1, Ordering::Relaxed) % self.senders.len();
-        if let Err(e) = self.senders[manager_idx].try_send(request) {
-            metrics::log_subscription_queue_length_delta(-1);
-            return Err(match e {
-                TrySendError::Full(..) => metrics::subscriptions_worker_full_error().into(),
-                TrySendError::Closed(..) => metrics::shutdown_error(),
-            });
-        }
-        Ok(subscription)
+                    // Round-robin selection of manager to handle this subscription
+                    if let Err(e) = self.senders[manager_idx].try_send(request) {
+                        metrics::log_subscription_queue_length_delta(-1);
+                        shared.remove(&key);
+                        return Err(match e {
+                            TrySendError::Full(..) => {
+                                metrics::subscriptions_worker_full_error().into()
+                            },
+                            TrySendError::Closed(..) => metrics::shutdown_error(),
+                        });
+                    }
+                    // The manager acks with the SubscriptionKey assigned to the
+                    // entry; a pending release (all clients dropped before the
+                    // ack) is dispatched once we know it.
+                    let ack_entry = entry.clone();
+                    tokio::spawn(async move {
+                        if let Ok(subscription_key) = response_rx.await {
+                            ack_entry.ack(subscription_key);
+                        }
+                    });
+                    shared.insert(key, entry.clone());
+                    entry
+                },
+            }
+        };
+        Ok(entry.handle())
     }
 
     pub fn shutdown(&self) {
         for handle in self.handles.lock().iter_mut() {
             handle.shutdown();
         }
+    }
+
+    #[cfg(feature = "testing")]
+    /// Number of dedup-map entries (test helper).
+    pub fn test_shared_len(&self) -> usize {
+        self.shared.lock().len()
     }
 }
 
@@ -210,10 +291,145 @@ impl SubscriptionSender {
     }
 }
 
-struct SubscriptionRequest {
-    token: Token,
-    sender: SubscriptionSender,
-    is_system: bool,
+enum SubscriptionRequest {
+    Subscribe {
+        token: Token,
+        sender: SubscriptionSender,
+        is_system: bool,
+        /// Acks the manager-assigned `SubscriptionKey`, used to release the
+        /// manager entry when the last shared handle is dropped.
+        response: oneshot::Sender<SubscriptionKey>,
+    },
+    /// Release a shared subscription: removes the manager entry if it is
+    /// still current (the seq guard makes this idempotent against entries
+    /// that were already invalidated or re-created).
+    Release { key: SubscriptionKey },
+}
+
+/// Deduplication key for identical subscriptions: a digest of the read set,
+/// the (refreshed) timestamp, and whether the subscription is a system
+/// subscription.
+type DedupKey = (u64, Timestamp, bool);
+
+/// A subscription shared by many clients (same query, same read set).
+///
+/// The manager holds exactly one entry (one ReadSet, one interval-map
+/// footprint) for all of them; each client gets its own handle that shares
+/// the validity and watch state. The entry is released when either the last
+/// handle drops or the underlying subscription is invalidated by a write.
+struct SharedSubscriptionEntry {
+    key: DedupKey,
+    validity: Arc<Mutex<Validity>>,
+    // The original receiver, cloned for every handle. The entry itself does
+    // not keep the channel alive after all handles are dropped, so the
+    // manager's watch-close path still works as a backup to `Release`.
+    valid_rx: watch::Receiver<SubscriptionState>,
+    users: Arc<AtomicUsize>,
+    subscription_key: Arc<Mutex<Option<SubscriptionKey>>>,
+    release_pending: Arc<AtomicBool>,
+    invalid: Arc<AtomicBool>,
+    release_tx: mpsc::Sender<SubscriptionRequest>,
+    shared: Arc<Mutex<HashMap<DedupKey, Arc<SharedSubscriptionEntry>>>>,
+}
+
+impl SharedSubscriptionEntry {
+    fn is_invalid(&self) -> bool {
+        self.invalid.load(Ordering::SeqCst)
+    }
+
+    /// The underlying subscription was invalidated by a write: evict the
+    /// stale entry from the dedup map so future subscribes with the same key
+    /// create a fresh one.
+    fn mark_invalid(&self) {
+        self.invalid.store(true, Ordering::SeqCst);
+        self.evict();
+    }
+
+    /// Evict this entry from the dedup map. Safe to call more than once; if a
+    /// newer entry for the same key was created in the meantime it is only
+    /// removed from the map (cost: a missed dedup), never invalidated.
+    fn evict(&self) {
+        self.shared.lock().remove(&self.key);
+    }
+
+    fn ack(&self, subscription_key: SubscriptionKey) {
+        *self.subscription_key.lock() = Some(subscription_key);
+        if self.release_pending.load(Ordering::SeqCst) {
+            // All clients dropped before the manager acked. The manager entry
+            // is released below, so the dedup map must not keep a handle to a
+            // dead subscription.
+            self.evict();
+            self.send_release(subscription_key);
+        }
+    }
+
+    fn send_release(&self, subscription_key: SubscriptionKey) {
+        let release_tx = self.release_tx.clone();
+        tokio::spawn(async move {
+            // Best effort: the manager's watch-close path cleans up if this
+            // send is dropped (e.g. on shutdown).
+            drop(release_tx.send(SubscriptionRequest::Release {
+                key: subscription_key,
+            }));
+        });
+    }
+
+    /// A new client handle sharing this subscription.
+    fn handle(&self) -> Subscription {
+        self.users.fetch_add(1, Ordering::SeqCst);
+        let users = self.users.clone();
+        let key = self.key;
+        let shared = self.shared.clone();
+        let subscription_key = self.subscription_key.clone();
+        let release_pending = self.release_pending.clone();
+        let release_tx = self.release_tx.clone();
+        Subscription {
+            validity: self.validity.clone(),
+            valid: self.valid_rx.clone(),
+            _timer: metrics::subscription_timer(),
+            on_drop: Some(Box::new(move || {
+                // The last client drop releases the manager entry and evicts
+                // this entry from the dedup map, so the next subscriber with
+                // the same read set creates a fresh subscription. A handle
+                // created from a stale map entry would otherwise watch a
+                // channel whose manager-side subscription was already
+                // released, and silently never receive invalidation events.
+                if users.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    shared.lock().remove(&key);
+                    match *subscription_key.lock() {
+                        Some(key) => {
+                            let release_tx = release_tx.clone();
+                            tokio::spawn(async move {
+                                drop(release_tx.send(SubscriptionRequest::Release { key }));
+                            });
+                        },
+                        None => release_pending.store(true, Ordering::SeqCst),
+                    }
+                }
+            })),
+        }
+    }
+}
+
+/// A digest of a read set for deduplication. Not cryptographic; equal read
+/// sets hash equally because iteration order is deterministic.
+fn reads_digest(reads: &ReadSet) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for (index, index_reads) in reads.iter_indexed() {
+        index.hash(&mut hasher);
+        index_reads.fields.hash(&mut hasher);
+        for interval in index_reads.intervals.iter() {
+            interval.hash(&mut hasher);
+        }
+    }
+    for (index, search_reads) in reads.iter_search() {
+        index.hash(&mut hasher);
+        let text_queries: &Vec<TextQueryTermRead> = &search_reads.text_queries;
+        text_queries.hash(&mut hasher);
+        let filter_conditions: &Vec<FilterConditionRead> = &search_reads.filter_conditions;
+        filter_conditions.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// Tracks the minimum processed_ts across all SubscriptionManagers to
@@ -296,6 +512,7 @@ impl SubscriptionsWorker {
             log: log_reader,
             senders,
             next_manager: Arc::new(AtomicUsize::new(0)),
+            shared: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -329,13 +546,25 @@ impl SubscriptionManager {
                 },
                 request = rx.recv().fuse() => {
                     match request {
-                        Some(SubscriptionRequest { token, sender, is_system }) => {
+                        Some(SubscriptionRequest::Subscribe {
+                            token,
+                            sender,
+                            is_system,
+                            response,
+                        }) => {
                             match self.subscribe(token, sender, is_system) {
-                                Ok(_) => (),
+                                Ok(key) => {
+                                    let _ = response.send(key);
+                                },
                                 Err(mut e) => {
                                     report_error(&mut e).await;
                                 },
                             }
+                        },
+                        Some(SubscriptionRequest::Release { key }) => {
+                            // Idempotent: no-ops if the entry was already
+                            // invalidated or re-created (seq mismatch).
+                            self.remove(key);
                         },
                         None => {
                             tracing::info!("All clients have gone away, shutting down subscriptions worker...");
@@ -418,7 +647,7 @@ impl SubscriptionManager {
         mut token: Token,
         sender: SubscriptionSender,
         is_system: bool,
-    ) -> anyhow::Result<SubscriberId> {
+    ) -> anyhow::Result<SubscriptionKey> {
         metrics::log_subscription_queue_lag(self.log.max_ts().secs_since_f64(token.ts()));
         // The client may not have fully refreshed their token past our
         // processed timestamp, so finish the job for them if needed.
@@ -434,8 +663,12 @@ impl SubscriptionManager {
                 Err(invalid_ts) => {
                     *sender.validity.lock() = Validity::Invalid(invalid_ts);
                     // N.B.: we only use the returned value for tests which
-                    // don't encounter this case
-                    return Ok(usize::MAX);
+                    // don't encounter this case. The `id` is invalid so any
+                    // later release is a no-op.
+                    return Ok(SubscriptionKey {
+                        id: usize::MAX,
+                        seq: usize::MAX,
+                    });
                 },
             };
         }
@@ -472,7 +705,7 @@ impl SubscriptionManager {
             }
             .boxed(),
         );
-        Ok(subscriber_id)
+        Ok(key)
     }
 
     pub fn interval_map(&self, index_name: &TabletIndexName) -> Option<&IntervalMap> {
@@ -826,16 +1059,45 @@ pub struct Subscription {
     // May lag behind `validity` in case of subscription splaying
     valid: watch::Receiver<SubscriptionState>,
     _timer: Timer<VMHistogram>,
+    // Invoked when this handle is dropped. Used by deduplicated
+    // subscriptions to release the shared manager entry when the last client
+    // disconnects.
+    on_drop: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(on_drop) = self.on_drop.take() {
+            on_drop();
+        }
+    }
 }
 
 impl Subscription {
-    fn new(token: &Token) -> (Self, SubscriptionSender) {
+    /// Creates the shared validity + watch state.
+    fn new_parts(
+        token: &Token,
+    ) -> (
+        Arc<Mutex<Validity>>,
+        watch::Sender<SubscriptionState>,
+        watch::Receiver<SubscriptionState>,
+    ) {
         let validity = Arc::new(Mutex::new(Validity::valid(token.ts())));
         let (valid_tx, valid_rx) = watch::channel(SubscriptionState::Valid);
+        (validity, valid_tx, valid_rx)
+    }
+
+    /// Assembles a `Subscription` + `SubscriptionSender` from shared state.
+    fn new_from_parts(
+        validity: Arc<Mutex<Validity>>,
+        valid_tx: watch::Sender<SubscriptionState>,
+        valid_rx: watch::Receiver<SubscriptionState>,
+    ) -> (Self, SubscriptionSender) {
         let subscription = Subscription {
             validity: validity.clone(),
             valid: valid_rx,
             _timer: metrics::subscription_timer(),
+            on_drop: None,
         };
         (subscription, SubscriptionSender { validity, valid_tx })
     }
@@ -846,6 +1108,7 @@ impl Subscription {
             validity: Arc::new(Mutex::new(Validity::invalid(invalid_ts))),
             valid: receiver,
             _timer: metrics::subscription_timer(),
+            on_drop: None,
         }
     }
 

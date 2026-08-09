@@ -34,6 +34,12 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct IndexedFields(WithHeapSize<Vec<FieldPath>>);
 
+impl std::hash::Hash for IndexedFields {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
 impl IndexedFields {
     pub const fn by_id() -> Self {
         IndexedFields(WithHeapSize::new_vec())
