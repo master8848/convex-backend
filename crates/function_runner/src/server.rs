@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::Context;
 use async_trait::async_trait;
-
 use common::{
     auth::AuthConfig,
     bootstrap_model::components::definition::ComponentDefinitionMetadata,
@@ -25,7 +24,10 @@ use common::{
         fetch::FetchClient,
         RoutedHttpPath,
     },
-    knobs::MAX_ISOLATE_WORKERS,
+    knobs::{
+        ISOLATE_EXECUTION_ENABLED,
+        MAX_ISOLATE_WORKERS,
+    },
     log_lines::LogLine,
     persistence::RetentionValidator,
     query_journal::QueryJournal,
@@ -48,6 +50,7 @@ use database::{
     Transaction,
     TransactionTextSnapshot,
 };
+use errors::ErrorMetadata;
 use file_storage::TransactionalFileStorage;
 use futures::FutureExt;
 use indexing::index_reader::IndexReader;
@@ -110,15 +113,15 @@ use udf::{
     SyscallTrace,
     UdfOutcome,
 };
-use value::{
-    JsonPackedValue,
-    MAX_COMMIT_TS,
-};
 use usage_tracking::{
     FunctionUsageStats,
     FunctionUsageTracker,
 };
-use value::identifier::Identifier;
+use value::{
+    identifier::Identifier,
+    JsonPackedValue,
+    MAX_COMMIT_TS,
+};
 
 use super::in_memory_indexes::InMemoryIndexCache;
 use crate::{
@@ -204,7 +207,7 @@ pub struct FunctionRunnerCore<RT: Runtime, S: StorageForDeployment<RT>> {
     index_cache: InMemoryIndexCache<RT>,
     module_cache: ModuleCache<RT>,
     code_cache: CodeCache,
-    isolate_client: IsolateClient<RT>,
+    isolate_client: Option<IsolateClient<RT>>,
     wasm_runner: Arc<wasm_runner::WasmRunner>,
 }
 
@@ -249,13 +252,35 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         max_percent_per_client: usize,
         isolate_worker: W,
     ) -> anyhow::Result<Self> {
-        let max_isolate_workers = *MAX_ISOLATE_WORKERS;
-        let isolate_client = IsolateClient::new(
-            rt.clone(),
+        Self::_new(
+            rt,
+            storage,
             max_percent_per_client,
-            max_isolate_workers,
             isolate_worker,
-        )?;
+            *ISOLATE_EXECUTION_ENABLED,
+        )
+    }
+
+    pub fn _new<W: IsolateWorker<RT>>(
+        rt: RT,
+        storage: S,
+        max_percent_per_client: usize,
+        isolate_worker: W,
+        isolate_execution_enabled: bool,
+    ) -> anyhow::Result<Self> {
+        // Constructing the isolate client eagerly initializes V8, loads ICU, and
+        // builds the UDF runtime snapshot. For wasm-only deployments we skip it
+        // entirely so the process never touches the JS engine.
+        let isolate_client = if isolate_execution_enabled {
+            Some(IsolateClient::new(
+                rt.clone(),
+                max_percent_per_client,
+                *MAX_ISOLATE_WORKERS,
+                isolate_worker,
+            )?)
+        } else {
+            None
+        };
         let index_cache = InMemoryIndexCache::new(rt.clone());
         let module_cache = ModuleCache::new(rt.clone());
         let code_cache = CodeCache::new();
@@ -273,15 +298,20 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
     }
 
     pub fn active_isolate_workers(&self) -> usize {
-        self.isolate_client.active_workers()
+        self.isolate_client
+            .as_ref()
+            .map_or(0, |c| c.active_workers())
     }
 
     pub fn max_isolate_workers(&self) -> usize {
-        self.isolate_client.max_workers()
+        self.isolate_client.as_ref().map_or(0, |c| c.max_workers())
     }
 
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        self.isolate_client.shutdown().await
+        if let Some(isolate_client) = &self.isolate_client {
+            isolate_client.shutdown().await?;
+        }
+        Ok(())
     }
 
     // Runs a function given the information for the backend as well as arguments
@@ -420,7 +450,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     ));
                 }
                 let (tx, outcome) = self
-                    .isolate_client
+                    .require_isolate_client()?
                     .execute_udf(
                         udf_type,
                         path_and_args,
@@ -504,7 +534,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     ));
                 }
                 let outcome = self
-                    .isolate_client
+                    .require_isolate_client()?
                     .execute_action(
                         path_and_args,
                         transaction,
@@ -538,7 +568,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 let identity =
                     propagate_component_auth(&identity, component_id, component_id.is_root());
                 let outcome = self
-                    .isolate_client
+                    .require_isolate_client()?
                     .execute_http_action(
                         http_module_path,
                         routed_path,
@@ -649,10 +679,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         let wasm_binary = self
             .fetch_wasm_binary(&mut transaction, &path, modules_storage)
             .await?;
-        let function_name = path
-            .udf_path
-            .function_name()
-            .to_string();
+        let function_name = path.udf_path.function_name().to_string();
         let args_json = arguments.get().to_string();
         let (transaction, result) = wasm_runner::run_wasm_udf(
             &self.wasm_runner,
@@ -705,7 +732,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             "Can only analyze Isolate modules"
         );
 
-        self.isolate_client
+        self.require_isolate_client()?
             .analyze(udf_config, modules, environment_variables, deployment_name)
             .await
     }
@@ -731,7 +758,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             "Can only evaluate Isolate modules"
         );
 
-        self.isolate_client
+        self.require_isolate_client()?
             .evaluate_app_definitions(
                 app_definition,
                 component_definitions,
@@ -753,7 +780,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         name: ComponentName,
         deployment_name: String,
     ) -> anyhow::Result<BTreeMap<Identifier, Resource>> {
-        self.isolate_client
+        self.require_isolate_client()?
             .evaluate_component_initializer(
                 evaluated_definitions,
                 path,
@@ -774,7 +801,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         unix_timestamp: UnixTimestamp,
         deployment_name: String,
     ) -> anyhow::Result<DatabaseSchema> {
-        self.isolate_client
+        self.require_isolate_client()?
             .evaluate_schema(
                 schema_bundle,
                 source_map,
@@ -794,7 +821,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         explanation: &str,
         deployment_name: String,
     ) -> anyhow::Result<AuthConfig> {
-        self.isolate_client
+        self.require_isolate_client()?
             .evaluate_auth_config(
                 auth_config_bundle,
                 source_map,
@@ -803,5 +830,18 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 deployment_name,
             )
             .await
+    }
+
+    /// Returns the isolate client or a clear error when JS execution is
+    /// disabled (wasm-only deployment).
+    fn require_isolate_client(&self) -> anyhow::Result<&IsolateClient<RT>> {
+        self.isolate_client.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(ErrorMetadata::bad_request(
+                "JavaScriptExecutionDisabled",
+                "This deployment is configured without the JavaScript engine \
+                 (ISOLATE_EXECUTION_ENABLED=false). JavaScript functions and module analysis are \
+                 unavailable; only WASM functions can run."
+            ))
+        })
     }
 }

@@ -134,6 +134,15 @@ pub struct LocalConfig {
     #[clap(long)]
     pub local_log_sink: Option<String>,
 
+    /// Disable the JavaScript (V8) execution engine entirely.
+    ///
+    /// Use this for wasm-only single deployments: the backend skips V8
+    /// initialization, ICU data, and the UDF runtime snapshot, saving
+    /// hundreds of MB of RAM at startup. JavaScript functions and module
+    /// analysis will fail with a clear error; only WASM functions run.
+    #[clap(long, env = "DISABLE_JS_ENGINE", value_parser = clap::builder::BoolishValueParser::new())]
+    pub disable_js_engine: bool,
+
     #[clap(subcommand)]
     pub subcommand: Option<Subcommand>,
 }
@@ -248,5 +257,4 @@ impl LocalConfig {
             }
         }
     }
-
 }

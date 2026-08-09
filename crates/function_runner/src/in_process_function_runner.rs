@@ -139,6 +139,7 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
         storage: DeploymentStorage,
         database: Database<RT>,
         fetch_client: Arc<dyn FetchClient>,
+        isolate_execution_enabled: bool,
     ) -> anyhow::Result<Self> {
         // InProcessFunctionRunner is single tenant and thus can use the full capacity.
         let max_percent_per_client = 100;
@@ -153,7 +154,13 @@ impl<RT: Runtime> InProcessFunctionRunner<RT> {
         );
         let isolate_config = IsolateConfig::new("funrun", concurrency_limiter);
         let isolate_worker = FunctionRunnerIsolateWorker::new(rt.clone(), isolate_config);
-        let server = FunctionRunnerCore::new(rt, storage, max_percent_per_client, isolate_worker)?;
+        let server = FunctionRunnerCore::_new(
+            rt,
+            storage,
+            max_percent_per_client,
+            isolate_worker,
+            isolate_execution_enabled,
+        )?;
         Ok(Self {
             server,
             persistence_reader,

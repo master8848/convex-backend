@@ -938,6 +938,17 @@ pub static ISOLATE_QUEUE_CONGESTED_TIMEOUT: LazyLock<Duration> =
 pub static MAX_ISOLATE_WORKERS: LazyLock<usize> =
     LazyLock::new(|| env_config("MAX_ISOLATE_WORKERS", 300));
 
+/// Whether the JavaScript (V8/deno_core) execution engine is enabled.
+///
+/// Set to false for wasm-only deployments. This skips the eager V8 platform
+/// initialization, ICU data load, and the UDF runtime snapshot creation in
+/// `initialize_v8`, saving hundreds of MB of process RAM, and it also means
+/// `ISOLATE_V8_FLAGS` (including any fuzz/jit-related flags) are never
+/// applied. Function runner methods that require an isolate fail with a
+/// clear error in this mode.
+pub static ISOLATE_EXECUTION_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("ISOLATE_EXECUTION_ENABLED", true));
+
 /// The size of the pending commits in the committer queue. This is a FIFO
 /// queue, so if the queue is too large, we run into a risk of all requests
 /// waiting too long and no requests going through during overload. The size of
@@ -955,6 +966,14 @@ pub static COMMITTER_MAX_CONCURRENT_COMMITS: LazyLock<usize> =
 
 /// 0 -> default (number of cores)
 pub static V8_THREADS: LazyLock<u32> = LazyLock::new(|| env_config("V8_THREADS", 0));
+
+/// When false (default), fuzz-related V8 flags passed via `ISOLATE_V8_FLAGS`
+/// (e.g. `--jit-fuzzing`, `--experimental-fuzzing`, `--randomize-hashes`) are
+/// silently dropped. These are only useful when fuzzing the runtime itself and
+/// break UDF determinism, so single deployments should never run with them.
+/// Set to true only when fuzzing the JS engine locally.
+pub static V8_ALLOW_FUZZING_FLAGS: LazyLock<bool> =
+    LazyLock::new(|| env_config("V8_ALLOW_FUZZING_FLAGS", false));
 
 /// If false, each UDF runs in its own isolate with its own heap.
 /// If true, each UDF runs in the same isolate in its own context, sharing a

@@ -63,6 +63,7 @@ use common::{
         ISOLATE_QUEUE_IDLE_TIMEOUT,
         ISOLATE_QUEUE_SIZE,
         REUSE_ISOLATES,
+        V8_ALLOW_FUZZING_FLAGS,
         V8_THREADS,
     },
     log_lines::LogLine,
@@ -212,7 +213,6 @@ impl IsolateConfig {
             limiter,
         }
     }
-
 }
 
 pub struct UdfRequest<RT: Runtime> {
@@ -466,6 +466,20 @@ impl<RT: Runtime> Clone for IsolateClient<RT> {
     }
 }
 
+/// V8 flags that are only useful for fuzzing the runtime itself. They break
+/// UDF determinism (e.g. `--randomize-hashes`) or are pure fuzzer knobs, so
+/// they are dropped in production deployments unless explicitly allowed.
+fn is_fuzz_v8_flag(flag: &str) -> bool {
+    const FUZZ_V8_FLAGS: &[&str] = &[
+        "--jit-fuzzing",
+        "--experimental-fuzzing",
+        "--randomize-hashes",
+        "--fuzzer-wasm",
+        "--fuzzer-heap-limit",
+    ];
+    FUZZ_V8_FLAGS.iter().any(|f| flag.starts_with(f))
+}
+
 pub fn initialize_v8() {
     ensure_utc().expect("Failed to setup timezone");
     static V8_INIT: Once = Once::new();
@@ -515,12 +529,30 @@ pub fn initialize_v8() {
             "--js-base-64".to_string(),
         ];
         if let Ok(flags) = env::var("ISOLATE_V8_FLAGS") {
-            argv.extend(
-                flags
-                    .split(" ")
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_owned()),
-            );
+            let extra_flags: Vec<String> = flags
+                .split(" ")
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_owned())
+                .collect();
+            // Fuzz-related V8 flags are only useful when fuzzing the runtime
+            // itself and break UDF determinism, so single deployments should
+            // never run with them. Strip them out unless explicitly opted in
+            // via `V8_ALLOW_FUZZING_FLAGS`.
+            if !*V8_ALLOW_FUZZING_FLAGS {
+                let (fuzz_flags, safe_flags): (Vec<_>, Vec<_>) = extra_flags
+                    .into_iter()
+                    .partition(|flag| is_fuzz_v8_flag(flag));
+                if !fuzz_flags.is_empty() {
+                    tracing::warn!(
+                        ?fuzz_flags,
+                        "Dropping fuzz-related V8 flags. Set V8_ALLOW_FUZZING_FLAGS=true to keep \
+                         them."
+                    );
+                }
+                argv.extend(safe_flags);
+            } else {
+                argv.extend(extra_flags);
+            }
             tracing::info!("Final V8 flags: {:?}", argv);
         }
         // v8 returns the args that were misunderstood

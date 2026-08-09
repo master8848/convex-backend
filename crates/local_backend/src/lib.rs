@@ -241,6 +241,7 @@ pub async fn make_app(
             },
             database.clone(),
             fetch_client.clone(),
+            !config.disable_js_engine,
         )?);
 
     let application = Application::new(
