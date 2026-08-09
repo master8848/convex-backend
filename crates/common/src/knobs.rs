@@ -1977,9 +1977,11 @@ pub static UDF_404_ON_BAD_PATH: LazyLock<bool> =
     LazyLock::new(|| env_config("UDF_404_ON_BAD_PATH", false));
 
 /// Percentage of index page queries to send to the database to verify that
-/// cache results match.
+/// cache results match. Defaults to a 1% sampling rate so the safety net
+/// stays effective without doubling read I/O on every cache hit. Set to 0
+/// to disable verification entirely.
 pub static INDEX_CACHE_VERIFY_PERCENT: LazyLock<u8> =
-    LazyLock::new(|| env_config("INDEX_CACHE_VERIFY_PERCENT", 100));
+    LazyLock::new(|| env_config("INDEX_CACHE_VERIFY_PERCENT", 1));
 
 /// Initial backoff for retrying failed persistence writes.
 pub static INITIAL_PERSISTENCE_WRITES_BACKOFF: LazyLock<Duration> = LazyLock::new(|| {

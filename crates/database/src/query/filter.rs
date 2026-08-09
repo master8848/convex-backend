@@ -32,6 +32,9 @@ pub(super) struct Filter {
 
 impl Filter {
     pub fn new(inner: QueryNode, expr: Expression) -> Self {
+        // Fold constant subtrees (no `Field` nodes) into `Literal`s once, so
+        // per-document evaluation only pays for what depends on the document.
+        let expr = expr.fold_constants();
         Self { inner, expr }
     }
 }
@@ -64,8 +67,7 @@ impl QueryStream for Filter {
                         return Ok(QueryStreamNext::WaitingOn(request))
                     },
                 };
-            let value = document.value().0.clone();
-            if self.expr.eval(&value)?.into_boolean()? {
+            if self.expr.eval(&document.value().0)?.into_boolean()? {
                 return Ok(QueryStreamNext::Ready(Some((document, write_timestamp))));
             }
         }

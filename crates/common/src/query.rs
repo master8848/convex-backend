@@ -891,6 +891,94 @@ impl Expression {
     pub fn and(left: Expression, right: Expression) -> Self {
         Expression::And(vec![left, right])
     }
+
+    /// Recursively replace subtrees that contain no `Field` nodes with their
+    /// pre-evaluated `Literal` value.
+    ///
+    /// `Expression`s are evaluated once per candidate document by the filter
+    /// query node, so a subtree that does not depend on the document (a plain
+    /// `Literal` or, say, `Literal(a) + Literal(b)`) would be re-evaluated and
+    /// re-cloned for every document. Folding it once here memoizes that work.
+    ///
+    /// Subtrees that fail to evaluate (e.g. an out-of-range arithmetic
+    /// operation) are left unfolded, so the error still surfaces at
+    /// evaluation time, exactly as before.
+    pub fn fold_constants(self) -> Self {
+        let folded = match self {
+            Expression::Eq(l, r) => {
+                Expression::Eq(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Neq(l, r) => {
+                Expression::Neq(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Lt(l, r) => {
+                Expression::Lt(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Lte(l, r) => {
+                Expression::Lte(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Gt(l, r) => {
+                Expression::Gt(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Gte(l, r) => {
+                Expression::Gte(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Add(l, r) => {
+                Expression::Add(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Sub(l, r) => {
+                Expression::Sub(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Mul(l, r) => {
+                Expression::Mul(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Div(l, r) => {
+                Expression::Div(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Mod(l, r) => {
+                Expression::Mod(l.fold_constants().into(), r.fold_constants().into())
+            },
+            Expression::Neg(x) => Expression::Neg(x.fold_constants().into()),
+            Expression::And(vs) => {
+                Expression::And(vs.into_iter().map(Self::fold_constants).collect())
+            },
+            Expression::Or(vs) => {
+                Expression::Or(vs.into_iter().map(Self::fold_constants).collect())
+            },
+            Expression::Not(x) => Expression::Not(x.fold_constants().into()),
+            Expression::Field(_) | Expression::Literal(_) => return self,
+        };
+        if !folded.contains_field() {
+            // No environment access: evaluate once and memoize the result.
+            if let Ok(value) = folded.eval(&ConvexObject::empty()) {
+                return Expression::Literal(value);
+            }
+        }
+        folded
+    }
+
+    /// Whether this expression references the environment (contains a `Field`
+    /// node). Expressions without fields evaluate identically for every
+    /// document, so they can be folded to a `Literal` once.
+    fn contains_field(&self) -> bool {
+        match self {
+            Expression::Field(_) => true,
+            Expression::Literal(_) => false,
+            Expression::Eq(l, r)
+            | Expression::Neq(l, r)
+            | Expression::Lt(l, r)
+            | Expression::Lte(l, r)
+            | Expression::Gt(l, r)
+            | Expression::Gte(l, r)
+            | Expression::Add(l, r)
+            | Expression::Sub(l, r)
+            | Expression::Mul(l, r)
+            | Expression::Div(l, r)
+            | Expression::Mod(l, r) => l.contains_field() || r.contains_field(),
+            Expression::Neg(x) | Expression::Not(x) => x.contains_field(),
+            Expression::And(vs) | Expression::Or(vs) => vs.iter().any(Self::contains_field),
+        }
+    }
 }
 
 /// Queries are lazy iterations, QueryOperators take and produce a stream of
@@ -987,5 +1075,105 @@ impl Query {
         let mut hasher = Sha256::new();
         hasher.write_all(&vec)?;
         Ok(hasher.finalize().to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use value::{
+        ConvexObject,
+        ConvexValue,
+    };
+
+    use super::Expression;
+
+    fn literal(value: ConvexValue) -> Expression {
+        Expression::Literal(value.into())
+    }
+
+    fn field(path: &str) -> Expression {
+        Expression::Field(path.parse().unwrap())
+    }
+
+    #[test]
+    fn fold_constants_folds_field_free_subtrees() {
+        // A bare literal is unchanged.
+        assert_eq!(
+            literal(ConvexValue::Int64(1)).fold_constants(),
+            literal(ConvexValue::Int64(1))
+        );
+        // Constant arithmetic folds to a literal.
+        assert_eq!(
+            Expression::Add(
+                literal(ConvexValue::Int64(1)).into(),
+                literal(ConvexValue::Int64(2)).into(),
+            )
+            .fold_constants(),
+            literal(ConvexValue::Int64(3)),
+        );
+        // Constant comparisons fold to a literal boolean.
+        assert_eq!(
+            Expression::Eq(
+                literal(ConvexValue::Int64(1)).into(),
+                literal(ConvexValue::Int64(2)).into(),
+            )
+            .fold_constants(),
+            literal(ConvexValue::Boolean(false)),
+        );
+    }
+
+    #[test]
+    fn fold_constants_keeps_field_dependent_subtrees() {
+        let expr = Expression::Eq(field("age").into(), literal(ConvexValue::Int64(18)).into());
+        assert_eq!(expr.clone().fold_constants(), expr);
+    }
+
+    #[test]
+    fn fold_constants_folds_inside_field_dependent_subtrees() {
+        // `age > (1 + 2)` folds the constant `1 + 2` to `3` while keeping `age`.
+        let expr = Expression::Gt(
+            field("age").into(),
+            Expression::Add(
+                literal(ConvexValue::Int64(1)).into(),
+                literal(ConvexValue::Int64(2)).into(),
+            )
+            .into(),
+        );
+        let expected = Expression::Gt(field("age").into(), literal(ConvexValue::Int64(3)).into());
+        assert_eq!(expr.fold_constants(), expected);
+    }
+
+    #[test]
+    fn fold_constants_skips_subtrees_that_fail_to_evaluate() {
+        // Division by zero is an evaluation error; the subtree must be left
+        // unfolded so the error still surfaces when the filter runs.
+        let expr = Expression::Div(
+            literal(ConvexValue::Int64(1)).into(),
+            literal(ConvexValue::Int64(0)).into(),
+        );
+        assert_eq!(expr.clone().fold_constants(), expr);
+    }
+
+    #[test]
+    fn fold_constants_preserves_eval_results() {
+        // Folding must never change what eval produces for any document.
+        let env: ConvexObject = ConvexObject::empty();
+        let expressions: [Expression; 2] = [
+            Expression::And(vec![
+                literal(ConvexValue::Boolean(true)),
+                Expression::Eq(field("age").into(), literal(ConvexValue::Int64(3)).into()),
+            ]),
+            Expression::Not(
+                Expression::Lt(
+                    literal(ConvexValue::Int64(2)).into(),
+                    literal(ConvexValue::Int64(1)).into(),
+                )
+                .into(),
+            ),
+        ];
+        for expr in expressions {
+            let folded = expr.clone().fold_constants();
+            assert_eq!(folded.eval(&env).unwrap(), expr.eval(&env).unwrap());
+        }
     }
 }

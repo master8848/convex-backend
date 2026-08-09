@@ -8,7 +8,10 @@ use std::{
         BTreeSet,
     },
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        LazyLock,
+    },
 };
 
 use anyhow::Context as _;
@@ -147,37 +150,13 @@ impl SqlitePersistence {
                 params.push(t);
                 format!(" AND key < ${}", params.len())
             },
-            None => "".to_owned(),
+            None => String::new(),
         };
 
-        let order = match order {
-            Order::Asc => "ASC",
-            Order::Desc => "DESC",
-        };
-        let query = format!(
-            r#"
-SELECT B.key, B.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
-FROM (
-    SELECT index_id, key, MAX(ts) as max_ts
-    FROM indexes
-    WHERE index_id = $1 AND ts <= $2{lower}{upper}
-    GROUP BY index_id, key
-) A
-JOIN indexes B
-ON B.deleted is FALSE
-AND A.index_id = B.index_id
-AND A.key = B.key
-AND A.max_ts = B.ts
-LEFT JOIN documents C
-ON B.ts = C.ts
-AND B.table_id = c.table_id
-AND B.document_id = C.id
-ORDER BY B.key {order}
-"#,
-        );
+        let query = &index_scan_query(lower, upper, order);
 
         let connection = &self.inner.lock().connection;
-        let mut stmt = connection.prepare(&query)?;
+        let mut stmt = connection.prepare_cached(query)?;
         let row_iter = stmt.query_map(&params[..], |row| {
             let key = IndexKeyBytes(row.get::<_, Vec<u8>>(0)?);
             let ts = Timestamp::try_from(row.get::<_, u64>(1)?).expect("timestamp out of bounds");
@@ -221,7 +200,7 @@ ORDER BY B.key {order}
         key: PersistenceGlobalKey,
     ) -> anyhow::Result<Option<JsonValue>> {
         let connection = &self.inner.lock().connection;
-        let mut stmt = connection.prepare(GET_PERSISTENCE_GLOBAL)?;
+        let mut stmt = connection.prepare_cached(GET_PERSISTENCE_GLOBAL)?;
         let key = String::from(key);
         let params: Vec<&dyn ToSql> = vec![&key];
         let mut row_iter = stmt.query_map(&params[..], |row| {
@@ -522,9 +501,9 @@ impl PersistenceReader for SqlitePersistence {
         let mut min_ts = Timestamp::MAX;
         {
             let inner = self.inner.lock();
+            let mut stmt = inner.connection.prepare_cached(PREV_REV_QUERY)?;
             for (id, ts) in ids {
                 min_ts = cmp::min(ts, min_ts);
-                let mut stmt = inner.connection.prepare(PREV_REV_QUERY)?;
                 let internal_id = id.internal_id();
                 let params = params![&id.table().0[..], &internal_id[..], &u64::from(ts)];
                 let mut row_iter = stmt.query_map(params, load_document_row)?;
@@ -559,8 +538,8 @@ impl PersistenceReader for SqlitePersistence {
         let mut out = BTreeMap::new();
         {
             let inner = self.inner.lock();
+            let mut stmt = inner.connection.prepare_cached(EXACT_REV_QUERY)?;
             for DocumentPrevTsQuery { id, ts, prev_ts } in ids {
-                let mut stmt = inner.connection.prepare(EXACT_REV_QUERY)?;
                 let internal_id = id.internal_id();
                 let params = params![&id.table().0[..], &internal_id[..], &u64::from(prev_ts)];
                 let mut row_iter = stmt.query_map(params, load_document_row)?;
@@ -711,6 +690,57 @@ WHERE ts >= {} AND ts < {}
         },
         order_str,
     )
+}
+
+/// Returns the prebuilt index scan SQL for the given lower/upper bound clauses
+/// and ordering. The query text is constant for each of the 8 combinations, so
+/// we build it once and let `prepare_cached` reuse the prepared statement.
+fn index_scan_query(lower: String, upper: String, order: Order) -> &'static str {
+    const ASC: &str = "ASC";
+    const DESC: &str = "DESC";
+    static QUERIES: LazyLock<BTreeMap<(bool, bool, &'static str), &'static str>> =
+        LazyLock::new(|| {
+            let mut queries = BTreeMap::new();
+            for lower_present in [false, true] {
+                for upper_present in [false, true] {
+                    for order in [ASC, DESC] {
+                        let lower_clause = if lower_present { " AND key >= $3" } else { "" };
+                        let upper_clause = if upper_present { " AND key < $4" } else { "" };
+                        let query: &'static str = Box::leak(
+                            format!(
+                                r#"
+SELECT B.key, B.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
+FROM (
+    SELECT index_id, key, MAX(ts) as max_ts
+    FROM indexes
+    WHERE index_id = $1 AND ts <= $2{lower_clause}{upper_clause}
+    GROUP BY index_id, key
+) A
+JOIN indexes B
+ON B.deleted is FALSE
+AND A.index_id = B.index_id
+AND A.key = B.key
+AND A.max_ts = B.ts
+LEFT JOIN documents C
+ON B.ts = C.ts
+AND B.table_id = c.table_id
+AND B.document_id = C.id
+ORDER BY B.key {order}
+"#,
+                            )
+                            .into_boxed_str(),
+                        );
+                        queries.insert((lower_present, upper_present, order), query);
+                    }
+                }
+            }
+            queries
+        });
+    let order_str = match order {
+        Order::Asc => ASC,
+        Order::Desc => DESC,
+    };
+    QUERIES[&(!lower.is_empty(), !upper.is_empty(), order_str)]
 }
 
 fn load_document_row(
