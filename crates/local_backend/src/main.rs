@@ -8,7 +8,10 @@ use cmd_util::env::{
 use common::{
     errors::MainError,
     http::ConvexHttpService,
-    knobs::HTTP_SERVER_TIMEOUT_DURATION,
+    knobs::{
+        HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
+        HTTP_SERVER_TIMEOUT_DURATION,
+    },
     runtime::Runtime,
     sentry::set_sentry_tags,
     shutdown::ShutdownSignal,
@@ -41,7 +44,6 @@ use local_backend::{
     proxy::dev_site_proxy,
     router::router,
     HttpActionRouteMapper,
-    MAX_CONCURRENT_REQUESTS,
 };
 use runtime::prod::ProdRuntime;
 use tokio::{
@@ -169,7 +171,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         router,
         "backend",
         SERVER_VERSION_STR.to_string(),
-        MAX_CONCURRENT_REQUESTS,
+        *HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );

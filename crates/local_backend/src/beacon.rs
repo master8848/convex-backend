@@ -2,8 +2,9 @@
 //! the self-hosted product.
 //!
 //! This module implements a beacon that periodically logs basic system
-//! information like database version. The beacon is disabled by default
-//! but can be enabled by setting CONVEX_ENABLE_BEACON=1.
+//! information like database version. The beacon is enabled by default for
+//! self-hosted builds but can be disabled by setting DISABLE_BEACON=1 (or
+//! passing --disable-beacon to the binary).
 //!
 //! No personally identifiable information is collected. The data helps Convex
 //! understand how self-hosted instances are being used to improve the product.

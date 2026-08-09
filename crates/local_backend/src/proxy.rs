@@ -15,7 +15,10 @@ use common::{
         HttpResponseError,
         NoopRouteMapper,
     },
-    knobs::HTTP_SERVER_TIMEOUT_DURATION,
+    knobs::{
+        HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
+        HTTP_SERVER_TIMEOUT_DURATION,
+    },
 };
 use hyper_util::rt::TokioExecutor;
 
@@ -60,7 +63,7 @@ pub async fn dev_site_proxy(
         Router::new().fallback_service(router),
         "backend_http_proxy",
         "unknown".to_string(),
-        4,
+        *HTTP_SERVER_MAX_CONCURRENT_REQUESTS,
         *HTTP_SERVER_TIMEOUT_DURATION,
         NoopRouteMapper,
     );
