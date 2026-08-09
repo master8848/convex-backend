@@ -4,6 +4,8 @@
 //! packed `(offset, len)` pair into host-managed call data holding the JSON
 //! envelope `{"ok": <value>}` or `{"err": <message>}`.
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use common::{
     components::ComponentId,
@@ -29,7 +31,6 @@ use serde_json::{
     json,
     Value as JsonValue,
 };
-use std::sync::Arc;
 use value::{
     DeveloperDocumentId,
     PendingValue,
@@ -54,13 +55,9 @@ pub(crate) struct DbShared<RT: Runtime> {
 /// line up.
 fn system_table_guard(name: &TableName, expect_system_table: bool) -> anyhow::Result<()> {
     if expect_system_table && !name.is_system() {
-        anyhow::bail!(
-            "SystemTableError: user tables cannot be accessed with db.system"
-        );
+        anyhow::bail!("SystemTableError: user tables cannot be accessed with db.system");
     } else if !expect_system_table && name.is_system() {
-        anyhow::bail!(
-            "SystemTableError: system tables can only be accessed with db.system"
-        );
+        anyhow::bail!("SystemTableError: system tables can only be accessed with db.system");
     }
     Ok(())
 }
@@ -110,10 +107,7 @@ fn developer_document_to_json<RT: Runtime>(
 /// Append bytes to host-managed call data, returning the `(offset, len)`
 /// packed into an `i64`, or `DB_ERROR` if the call-data limit would be
 /// exceeded.
-async fn write_to_call_data(
-    shared: &DbShared<impl Runtime>,
-    bytes: Vec<u8>,
-) -> i64 {
+async fn write_to_call_data(shared: &DbShared<impl Runtime>, bytes: Vec<u8>) -> i64 {
     let mut call_data = shared.call_data.lock().unwrap_or_else(|e| e.into_inner());
     let offset = call_data.len();
     if offset
@@ -157,26 +151,23 @@ struct GetArgs {
 }
 
 /// `db.get(table, id)` -> document or null.
-pub(crate) async fn db_get<RT: Runtime>(
-    shared: &DbShared<RT>,
-    args: &[u8],
-) -> i64 {
+pub(crate) async fn db_get<RT: Runtime>(shared: &DbShared<RT>, args: &[u8]) -> i64 {
     let result = async {
         let args: GetArgs = serde_json::from_slice(args).context("db.get")?;
         let id = DeveloperDocumentId::decode(&args.id).context("db.get: invalid id")?;
         let component = shared.component;
         let mut tx = shared.tx.lock().await;
         let namespace = component.into();
-        let table_name = match tx.resolve_idv6(id, namespace, TableFilter::ExcludePrivateSystemTables)
-        {
-            Ok(table_name) => {
-                check_table_name(&args.table, &table_name)?;
-                system_table_guard(&table_name, false)?;
-                Some(table_name)
-            },
-            // Get on a non-existent table should return null.
-            Err(_) => None,
-        };
+        let table_name =
+            match tx.resolve_idv6(id, namespace, TableFilter::ExcludePrivateSystemTables) {
+                Ok(table_name) => {
+                    check_table_name(&args.table, &table_name)?;
+                    system_table_guard(&table_name, false)?;
+                    Some(table_name)
+                },
+                // Get on a non-existent table should return null.
+                Err(_) => None,
+            };
         let Some(table_name) = table_name else {
             return Ok(JsonValue::Null);
         };
@@ -190,9 +181,7 @@ pub(crate) async fn db_get<RT: Runtime>(
             TableFilter::ExcludePrivateSystemTables,
         )?;
         match query.next_with_ts(&mut tx, Some(1)).await? {
-            Some((document, ts)) => {
-                developer_document_to_json(&mut tx, namespace, &document, ts)
-            },
+            Some((document, ts)) => developer_document_to_json(&mut tx, namespace, &document, ts),
             None => Ok(JsonValue::Null),
         }
     }
@@ -201,7 +190,10 @@ pub(crate) async fn db_get<RT: Runtime>(
 }
 
 fn parse_version(version: Option<String>) -> anyhow::Result<Option<Version>> {
-    version.map(|v| v.parse()).transpose().context("db.get: invalid version")
+    version
+        .map(|v| v.parse())
+        .transpose()
+        .context("db.get: invalid version")
 }
 
 #[derive(Deserialize)]
@@ -218,7 +210,10 @@ pub(crate) async fn db_count<RT: Runtime>(shared: &DbShared<RT>, args: &[u8]) ->
         system_table_guard(&table, false)?;
         let component = shared.component;
         let mut tx = shared.tx.lock().await;
-        let count = tx.count(component.into(), &table).await.context("db.count")?;
+        let count = tx
+            .count(component.into(), &table)
+            .await
+            .context("db.count")?;
         let Some(count) = count else {
             anyhow::bail!("db.count: table count unavailable while bootstrapping");
         };
@@ -240,7 +235,8 @@ struct InsertArgs {
 pub(crate) async fn db_insert<RT: Runtime>(shared: &DbShared<RT>, args: &[u8]) -> i64 {
     let result = async {
         let args: InsertArgs = serde_json::from_slice(args).context("db.insert")?;
-        let value = PendingValue::from_uncommitted_json(args.value).context("db.insert: invalid value")?;
+        let value =
+            PendingValue::from_uncommitted_json(args.value).context("db.insert: invalid value")?;
         if !value.is_object() {
             anyhow::bail!("db.insert: value must be an object");
         }
@@ -376,11 +372,12 @@ pub(crate) async fn db_query<RT: Runtime>(shared: &DbShared<RT>, args: &[u8]) ->
             let Some((document, ts)) = query.next_with_ts(&mut tx, Some(128)).await? else {
                 break;
             };
-            documents.push(developer_document_to_json(&mut tx, namespace, &document, ts)?);
+            documents.push(developer_document_to_json(
+                &mut tx, namespace, &document, ts,
+            )?);
         }
         Ok(JsonValue::Array(documents))
     }
     .await;
     write_result(shared, result).await
 }
-

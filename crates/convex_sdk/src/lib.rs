@@ -42,7 +42,6 @@ pub use convex_sdk_macros::{
 #[cfg(target_arch = "wasm32")]
 pub use rt::dispatch;
 pub use rt::FunctionDescriptor;
-
 use serde::{
     Deserialize,
     Serialize,
@@ -208,9 +207,7 @@ impl Default for Context {
 impl Context {
     /// Create a new execution context.
     pub fn new() -> Self {
-        Self {
-            db: Database,
-        }
+        Self { db: Database }
     }
 
     /// The deterministic, virtual current time in milliseconds since the Unix
@@ -244,15 +241,8 @@ pub struct Database;
 impl Database {
     /// Fetch a single document by id. Returns `Ok(None)` if it does not
     /// exist.
-    pub async fn get(
-        &self,
-        table: &str,
-        id: &str,
-    ) -> Result<Option<Document>, ConvexError> {
-        let result = rt::db_call(
-            rt::DB_GET,
-            &serde_json::json!({ "table": table, "id": id }),
-        )?;
+    pub async fn get(&self, table: &str, id: &str) -> Result<Option<Document>, ConvexError> {
+        let result = rt::db_call(rt::DB_GET, &serde_json::json!({ "table": table, "id": id }))?;
         match result {
             JsonValue::Null => Ok(None),
             value => Ok(Some(Document::from_internal_json(value)?)),
@@ -260,11 +250,7 @@ impl Database {
     }
 
     /// Insert a new document and return its id.
-    pub async fn insert(
-        &self,
-        table: &str,
-        value: ConvexValue,
-    ) -> Result<String, ConvexError> {
+    pub async fn insert(&self, table: &str, value: ConvexValue) -> Result<String, ConvexError> {
         let result = rt::db_call(
             rt::DB_INSERT,
             &serde_json::json!({ "table": table, "value": value.0 }),

@@ -77,10 +77,7 @@ fn build_rust_guest() -> anyhow::Result<(Vec<u8>, WasmFunctionDescriptor)> {
 
 /// Build the Go guest fixture, if the Go toolchain is available.
 fn build_go_guest() -> anyhow::Result<Option<(Vec<u8>, WasmFunctionDescriptor)>> {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/go_guest",
-    );
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/go_guest",);
     let output = std::process::Command::new("go")
         .args(["build", "-buildmode=c-shared", "-o", "go_guest.wasm", "."])
         .current_dir(dir)

@@ -586,5 +586,4 @@ impl TextIndexManager {
         }
         Ok(())
     }
-
 }

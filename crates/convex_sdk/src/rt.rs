@@ -187,10 +187,16 @@ pub fn db_call(name: &str, args: &JsonValue) -> Result<JsonValue, ConvexDbError>
         DB_DELETE => unsafe { __convex_db_delete(args.as_ptr() as i32, args.len() as i32) },
         DB_COUNT => unsafe { __convex_db_count(args.as_ptr() as i32, args.len() as i32) },
         DB_QUERY => unsafe { __convex_db_query(args.as_ptr() as i32, args.len() as i32) },
-        _ => return Err(ConvexDbError::system(format!("Unknown database operation {name}"))),
+        _ => {
+            return Err(ConvexDbError::system(format!(
+                "Unknown database operation {name}"
+            )))
+        },
     };
     if result < 0 {
-        return Err(ConvexDbError::system("Database operation failed".to_string()));
+        return Err(ConvexDbError::system(
+            "Database operation failed".to_string(),
+        ));
     }
     let offset = (result >> 32) as u32;
     let len = result as u32;

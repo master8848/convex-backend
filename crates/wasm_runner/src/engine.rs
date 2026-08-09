@@ -1,6 +1,14 @@
 //! The WASM execution engine: compilation, sandboxing, host functions, and
 //! call orchestration.
 
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        Mutex,
+    },
+};
+
 use anyhow::Context;
 use common::{
     components::ComponentId,
@@ -26,13 +34,6 @@ use serde::{
     Serialize,
 };
 use sha2::Digest;
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        Mutex,
-    },
-};
 use tokio::sync::mpsc;
 use wasmtime::{
     Caller,
@@ -127,13 +128,19 @@ impl WasmRunner {
             limits.max_module_size,
         );
         let sha256: [u8; 32] = sha2::Sha256::digest(module_binary).into();
-        if let Some(module) = self.module_cache.lock().expect("cache poisoned").get(&sha256) {
+        if let Some(module) = self
+            .module_cache
+            .lock()
+            .expect("cache poisoned")
+            .get(&sha256)
+        {
             return Ok(module.clone());
         }
-        let module = Arc::new(
-            Module::new(&self.engine, module_binary)
-                .map_err(|e| anyhow::anyhow!("Failed to compile WASM module (was it built with the convex_sdk?): {e}"))?,
-        );
+        let module = Arc::new(Module::new(&self.engine, module_binary).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to compile WASM module (was it built with the convex_sdk?): {e}"
+            )
+        })?);
         validate_module(&module, limits)?;
         let mut cache = self.module_cache.lock().expect("cache poisoned");
         if cache.len() >= MAX_CACHED_MODULES {
@@ -229,14 +236,22 @@ impl HostContext {
 /// Register the synchronous host functions (input, call data, output, log,
 /// now, random) on the linker.
 fn register_sync_host_functions(linker: &mut Linker<HostContext>) -> Result<(), wasmtime::Error> {
-    linker.func_wrap(HOST_FN_MODULE, INPUT_LENGTH, |caller: Caller<'_, HostContext>| -> i32 {
-        caller.data().input.len().min(i32::MAX as usize) as i32
-    })?;
+    linker.func_wrap(
+        HOST_FN_MODULE,
+        INPUT_LENGTH,
+        |caller: Caller<'_, HostContext>| -> i32 {
+            caller.data().input.len().min(i32::MAX as usize) as i32
+        },
+    )?;
 
     linker.func_wrap(
         HOST_FN_MODULE,
         INPUT_LOAD,
-        |mut caller: Caller<'_, HostContext>, offset: i32, dest: i32, len: i32| -> Result<(), wasmtime::Error> {
+        |mut caller: Caller<'_, HostContext>,
+         offset: i32,
+         dest: i32,
+         len: i32|
+         -> Result<(), wasmtime::Error> {
             let (offset, len) = checked_range(offset, len, caller.data().input.len())
                 .ok_or_else(|| wasmtime::Error::msg("__convex_input_load out of bounds"))?;
             let bytes = caller.data().input[offset..offset + len].to_vec();
@@ -275,7 +290,11 @@ fn register_sync_host_functions(linker: &mut Linker<HostContext>) -> Result<(), 
     linker.func_wrap(
         HOST_FN_MODULE,
         CALL_DATA_LOAD,
-        |mut caller: Caller<'_, HostContext>, offset: i32, dest: i32, len: i32| -> Result<(), wasmtime::Error> {
+        |mut caller: Caller<'_, HostContext>,
+         offset: i32,
+         dest: i32,
+         len: i32|
+         -> Result<(), wasmtime::Error> {
             let (offset, len) = checked_range(offset, len, call_data_len(&caller))
                 .ok_or_else(|| wasmtime::Error::msg("__convex_call_data_load out of bounds"))?;
             let call_data = caller.data().call_data.clone();
@@ -321,17 +340,20 @@ fn register_sync_host_functions(linker: &mut Linker<HostContext>) -> Result<(), 
         },
     )?;
 
-    linker.func_wrap(HOST_FN_MODULE, NOW_MS, |mut caller: Caller<'_, HostContext>| -> i64 {
-        caller.data_mut().observed_time = true;
-        caller.data().unix_timestamp_ms
-    })?;
+    linker.func_wrap(
+        HOST_FN_MODULE,
+        NOW_MS,
+        |mut caller: Caller<'_, HostContext>| -> i64 {
+            caller.data_mut().observed_time = true;
+            caller.data().unix_timestamp_ms
+        },
+    )?;
 
     linker.func_wrap(
         HOST_FN_MODULE,
         RANDOM_BYTES,
         |mut caller: Caller<'_, HostContext>, dest: i32, len: i32| -> Result<(), wasmtime::Error> {
-            let len = usize::try_from(len)
-                .map_err(|_| wasmtime::Error::msg("negative length"))?;
+            let len = usize::try_from(len).map_err(|_| wasmtime::Error::msg("negative length"))?;
             let mut bytes = vec![0u8; len];
             caller.data_mut().rng.fill_bytes(&mut bytes);
             caller.data_mut().observed_rng = true;
@@ -379,9 +401,7 @@ macro_rules! register_db_host_function {
                 let args = match HostContext::read_guest(&mut caller, args_ptr, args_len) {
                     Ok(args) => args,
                     Err(e) => {
-                        return Box::new(async move {
-                            Err(wasmtime::Error::msg(format!("{e}")))
-                        });
+                        return Box::new(async move { Err(wasmtime::Error::msg(format!("{e}"))) });
                     },
                 };
                 let shared = shared.clone();
@@ -451,8 +471,7 @@ pub(crate) async fn execute_module<RT: Runtime>(
         error: None,
         log_lines: Vec::new(),
         rng: ChaCha12Rng::from_seed(rng_seed),
-        unix_timestamp_ms: i64::try_from(unix_timestamp.as_nanos() / 1_000_000)
-            .unwrap_or_default(),
+        unix_timestamp_ms: i64::try_from(unix_timestamp.as_nanos() / 1_000_000).unwrap_or_default(),
         observed_rng: false,
         observed_time: false,
         max_call_data: limits.max_call_data,
@@ -492,32 +511,37 @@ pub(crate) async fn execute_module<RT: Runtime>(
         .get_typed_func(&mut store, GUEST_RUN)
         .map_err(|e| anyhow::anyhow!("Missing __convex_run export: {e}"))?;
 
-    let call_result = match tokio::time::timeout(limits.timeout, run.call_async(&mut store, ()))
-        .await
-    {
-        Err(_elapsed) => Err(JsError::from_message(format!(
-            "WASM function exceeded the {} second timeout",
-            limits.timeout.as_secs(),
-        ))),
-        Ok(Ok(status)) => {
-            if status == RUN_OK {
-                Ok(())
-            } else {
-                let error = store.data().error.clone().unwrap_or_default();
-                Err(JsError::from_message(String::from_utf8_lossy(&error).to_string()))
-            }
-        },
-        Ok(Err(trap)) => {
-            let message = trap.to_string();
-            if message.contains("all fuel consumed") {
-                Err(JsError::from_message("WASM function exceeded its instruction budget".to_string()))
-            } else if message.contains("memory") && message.contains("limit") {
-                Err(JsError::from_message(format!("WASM function exceeded the memory limit: {message}")))
-            } else {
-                Err(JsError::from_message(message))
-            }
-        },
-    };
+    let call_result =
+        match tokio::time::timeout(limits.timeout, run.call_async(&mut store, ())).await {
+            Err(_elapsed) => Err(JsError::from_message(format!(
+                "WASM function exceeded the {} second timeout",
+                limits.timeout.as_secs(),
+            ))),
+            Ok(Ok(status)) => {
+                if status == RUN_OK {
+                    Ok(())
+                } else {
+                    let error = store.data().error.clone().unwrap_or_default();
+                    Err(JsError::from_message(
+                        String::from_utf8_lossy(&error).to_string(),
+                    ))
+                }
+            },
+            Ok(Err(trap)) => {
+                let message = trap.to_string();
+                if message.contains("all fuel consumed") {
+                    Err(JsError::from_message(
+                        "WASM function exceeded its instruction budget".to_string(),
+                    ))
+                } else if message.contains("memory") && message.contains("limit") {
+                    Err(JsError::from_message(format!(
+                        "WASM function exceeded the memory limit: {message}"
+                    )))
+                } else {
+                    Err(JsError::from_message(message))
+                }
+            },
+        };
 
     let execution_result = match call_result {
         Ok(()) => {
@@ -555,7 +579,9 @@ pub struct WasmFunctionDescriptor {
 }
 
 /// Parse the JSON array returned by a guest's `__convex_functions` export.
-fn parse_function_descriptors(output: Option<Vec<u8>>) -> anyhow::Result<Vec<WasmFunctionDescriptor>> {
+fn parse_function_descriptors(
+    output: Option<Vec<u8>>,
+) -> anyhow::Result<Vec<WasmFunctionDescriptor>> {
     let output = output.context("__convex_functions returned no output")?;
     let descriptors: Vec<WasmFunctionDescriptor> =
         serde_json::from_slice(&output).context("__convex_functions returned invalid JSON")?;

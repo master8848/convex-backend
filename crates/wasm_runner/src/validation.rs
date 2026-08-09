@@ -56,8 +56,8 @@ pub fn validate_module(module: &Module, limits: &WasmLimits) -> anyhow::Result<(
             continue;
         }
         anyhow::bail!(
-            "WASM module imports {module_name}.{name}, which is outside the allowed \
-             sandbox surface",
+            "WASM module imports {module_name}.{name}, which is outside the allowed sandbox \
+             surface",
         );
     }
 
@@ -73,8 +73,7 @@ pub fn validate_module(module: &Module, limits: &WasmLimits) -> anyhow::Result<(
                 .context("Memory maximum overflow")?;
             anyhow::ensure!(
                 max_bytes <= limits.max_memory_bytes,
-                "WASM module declares {max_bytes} bytes of memory, exceeding the \
-                 limit of {} bytes",
+                "WASM module declares {max_bytes} bytes of memory, exceeding the limit of {} bytes",
                 limits.max_memory_bytes,
             );
         }
@@ -85,9 +84,7 @@ pub fn validate_module(module: &Module, limits: &WasmLimits) -> anyhow::Result<(
             let results = export.ty().func().map(|f| f.results().collect::<Vec<_>>());
             let valid = match (&params, &results) {
                 (Some(params), Some(results)) => {
-                    params.is_empty()
-                        && results.len() == 1
-                        && matches!(results[0], ValType::I32)
+                    params.is_empty() && results.len() == 1 && matches!(results[0], ValType::I32)
                 },
                 _ => false,
             };

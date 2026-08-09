@@ -26,8 +26,7 @@
 //! It also generates the two WASM exports the backend expects:
 //!
 //! - `__convex_run() -> i32`: the dispatcher.
-//! - `__convex_functions() -> i32`: the list of `{"name", "type"}`
-//!   descriptors.
+//! - `__convex_functions() -> i32`: the list of `{"name", "type"}` descriptors.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -110,12 +109,9 @@ pub fn http_action(_attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn convex_functions(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut module = parse_macro_input!(item as ItemMod);
     if !attr.is_empty() {
-        return syn::Error::new(
-            Span::call_site(),
-            "convex_functions takes no arguments",
-        )
-        .to_compile_error()
-        .into();
+        return syn::Error::new(Span::call_site(), "convex_functions takes no arguments")
+            .to_compile_error()
+            .into();
     }
 
     let Some((_, items)) = &mut module.content else {
@@ -188,8 +184,8 @@ pub fn convex_functions(attr: TokenStream, item: TokenStream) -> TokenStream {
         errors.push(
             syn::Error::new(
                 module.ident.span(),
-                "convex_functions requires at least one function annotated with \
-                 #[query], #[mutation], #[action], or #[http_action]",
+                "convex_functions requires at least one function annotated with #[query], \
+                 #[mutation], #[action], or #[http_action]",
             )
             .to_compile_error(),
         );

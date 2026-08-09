@@ -28,6 +28,7 @@ mod engine;
 mod limits;
 mod validation;
 
+pub use abi::*;
 use anyhow::Context;
 use common::{
     components::ComponentId,
@@ -43,20 +44,19 @@ use common::{
     },
 };
 use database::Transaction;
-use tokio::sync::mpsc;
-use value::{
-    JsonPackedValue,
-    PendingValue,
-    Size,
-};
-pub use abi::*;
 pub use engine::{
     analyze_functions,
     WasmFunctionDescriptor,
     WasmRunner,
 };
 pub use limits::WasmLimits;
+use tokio::sync::mpsc;
 pub use validation::validate_module;
+use value::{
+    JsonPackedValue,
+    PendingValue,
+    Size,
+};
 
 /// The result of a single WASM UDF execution.
 #[derive(Debug)]
@@ -163,8 +163,8 @@ fn deserialize_result(
     result_str: &str,
     allow_unresolved_commit_ts: bool,
 ) -> anyhow::Result<PendingValue> {
-    let result_v: serde_json::Value = serde_json::from_str(result_str)
-        .context("Function return value is not valid JSON")?;
+    let result_v: serde_json::Value =
+        serde_json::from_str(result_str).context("Function return value is not valid JSON")?;
     let value = PendingValue::from_uncommitted_json(result_v)
         .context("Function return value is not a valid Convex value")?;
     if !allow_unresolved_commit_ts && value.is_pending() {

@@ -190,7 +190,6 @@ pub struct Transaction<RT: Runtime> {
 
     pub usage_tracker: FunctionUsageTracker,
     pub(crate) virtual_system_mapping: VirtualSystemMapping,
-
 }
 
 #[async_trait]
@@ -1340,10 +1339,8 @@ impl<RT: Runtime> Transaction<RT> {
             runtime: self.runtime.clone(),
             usage_tracker: self.usage_tracker.clone(),
             virtual_system_mapping: self.virtual_system_mapping.clone(),
-
         }
     }
-
 }
 
 #[must_use]
@@ -1391,7 +1388,6 @@ pub struct FinalTransaction {
     pub(crate) writes: Writes,
 
     pub(crate) usage_tracker: FunctionUsageTracker,
-
 }
 
 impl FinalTransaction {
@@ -1411,7 +1407,6 @@ impl FinalTransaction {
             reads: transaction.reads,
             writes: transaction.writes.into_flat()?,
             usage_tracker: transaction.usage_tracker,
-
         })
     }
 
