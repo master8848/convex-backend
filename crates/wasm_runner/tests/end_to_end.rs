@@ -17,8 +17,8 @@ use common::{
     virtual_system_mapping::VirtualSystemMapping,
 };
 use database::{
-    TableModel,
     Database,
+    TableModel,
     Transaction,
 };
 use indexing::index_cache::IndexCache;
@@ -28,9 +28,9 @@ use search::{
     searcher::SearcherStub,
     Searcher,
 };
+use serde_json::Value as JsonValue;
 use sqlite::SqlitePersistence;
 use tokio::sync::mpsc;
-use serde_json::Value as JsonValue;
 use value::{
     PendingValue,
     TableNamespace,
@@ -45,10 +45,7 @@ use wasm_runner::{
 /// Builds the Go guest fixture and returns the compiled wasm bytes.
 /// Requires the Go toolchain. Returns None if `go` is not installed.
 fn build_go_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/go_guest",
-    );
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/go_guest",);
     let output = std::process::Command::new("go")
         .args(["build", "-buildmode=c-shared", "-o", "go_guest.wasm", "."])
         .current_dir(dir)
@@ -66,7 +63,9 @@ fn build_go_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
         String::from_utf8_lossy(&output.stderr),
     );
     let wasm_path = format!("{dir}/go_guest.wasm");
-    std::fs::read(wasm_path).context("Go guest module binary not found").map(Some)
+    std::fs::read(wasm_path)
+        .context("Go guest module binary not found")
+        .map(Some)
 }
 
 /// Builds the guest fixture crate and returns the compiled wasm bytes.
@@ -251,7 +250,9 @@ fn test_rust_guest_end_to_end() -> anyhow::Result<()> {
         let id = value
             .to_uncommitted_json()
             .as_str()
-            .context(format!("insert_user should return the id string, got: {value:?}"))?
+            .context(format!(
+                "insert_user should return the id string, got: {value:?}"
+            ))?
             .to_string();
         assert!(!id.is_empty());
         database
@@ -273,7 +274,10 @@ fn test_rust_guest_end_to_end() -> anyhow::Result<()> {
             json.pointer("/value/_id").and_then(JsonValue::as_str),
             Some(id.as_str()),
         );
-        assert_eq!(json.get("id").and_then(JsonValue::as_str), Some(id.as_str()));
+        assert_eq!(
+            json.get("id").and_then(JsonValue::as_str),
+            Some(id.as_str())
+        );
 
         // Query over the whole table.
         let (_, result) = run_function(
@@ -396,10 +400,7 @@ fn test_go_guest_end_to_end() -> anyhow::Result<()> {
         )
         .await?;
         let value: PendingValue = result.result?.unpack()?;
-        assert_eq!(
-            value.to_uncommitted_json(),
-            serde_json::json!("go hello"),
-        );
+        assert_eq!(value.to_uncommitted_json(), serde_json::json!("go hello"),);
 
         // add (with virtual time)
         let (_, result) = run_function(
@@ -468,6 +469,111 @@ fn test_go_guest_end_to_end() -> anyhow::Result<()> {
         let names: Vec<_> = functions.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"echo"));
         assert!(names.contains(&"bump"));
+
+        anyhow::Ok(())
+    })
+}
+
+/// Builds the freestanding C guest fixture and returns the compiled wasm
+/// bytes. Requires a clang that ships the `wasm32-wasip1` target (stock LLVM;
+/// Apple's system clang does not). Returns None if unavailable.
+fn build_c_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
+    let source = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/c_guest/guest.c"
+    );
+    let output = std::process::Command::new("clang")
+        .args([
+            "--target=wasm32-wasip1",
+            "-O3",
+            "-nostdlib",
+            "-Wl,--no-entry",
+            "-Wl,--export=__convex_run",
+            "-Wl,--export=__convex_functions",
+            "-Wl,--allow-undefined",
+            "-o",
+            "c_guest.wasm",
+            source,
+        ])
+        .current_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/c_guest"
+        ))
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("Failed to run clang to build the C guest module"),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No available targets are compatible")
+            || stderr.contains("unknown target")
+        {
+            eprintln!("clang lacks the wasm32-wasip1 target; skipping C guest test");
+            return Ok(None);
+        }
+        anyhow::bail!("clang build failed: {stderr}");
+    }
+    let wasm_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/c_guest/c_guest.wasm",
+    );
+    std::fs::read(wasm_path)
+        .context("C guest module binary not found")
+        .map(Some)
+}
+
+#[test]
+fn test_c_guest_end_to_end() -> anyhow::Result<()> {
+    let tokio = ProdRuntime::init_tokio()?;
+    tokio.block_on(async {
+        let Some(module_binary) = build_c_guest_module()? else {
+            return anyhow::Ok(());
+        };
+        let runner = WasmRunner::new()?;
+        let rt = ProdRuntime::new(&tokio);
+        let (persistence, mut database) = new_database(&rt).await?;
+        database = create_table(&database, &persistence, &rt, "counters").await?;
+
+        // echo: a freestanding C guest with no libc and no WASI imports.
+        let (_, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "echo",
+            serde_json::json!(["c hello"]),
+        )
+        .await?;
+        let value: PendingValue = result.result?.unpack()?;
+        assert_eq!(value.to_uncommitted_json(), serde_json::json!("c hello"));
+
+        // unknown function -> guest error, not a host panic.
+        let (_, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "no_such_fn",
+            serde_json::json!([]),
+        )
+        .await?;
+        assert!(result.result.is_err());
+
+        // descriptor analysis
+        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let tx = database.begin(Identity::Unknown(None)).await?;
+        let functions = wasm_runner::analyze_functions(
+            &runner,
+            &module,
+            tx,
+            ComponentId::Root,
+            [7u8; 32],
+            UnixTimestamp::from_millis(1_700_000_000_000),
+            WasmLimits::default(),
+        )
+        .await?;
+        let names: Vec<_> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["echo"]);
 
         anyhow::Ok(())
     })

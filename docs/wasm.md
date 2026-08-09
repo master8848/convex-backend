@@ -4,6 +4,26 @@ This document describes the WebAssembly execution path for Convex backend
 functions, how it relates to the existing TypeScript (isolate) and Node
 paths, and its current limitations.
 
+## Deployment modes
+
+The function runner supports two JS-engine modes, controlled by the
+`ISOLATE_EXECUTION_ENABLED` env var (default `true`) or the local backend's
+`--disable-js-engine` flag:
+
+- **Mixed (default)**: V8 + ICU + the UDF runtime snapshot are initialized
+  eagerly at startup; wasm and TypeScript functions both run.
+- **Wasm-only**: V8 is never initialized — no ICU data load, no UDF snapshot,
+  no V8 platform threads, no worker isolates. This saves hundreds of MB of
+  process RAM for deployments that only run wasm functions. Any request that
+  needs the JS engine (TypeScript functions, module analysis, HTTP actions,
+  schema/auth-config evaluation) fails with a clear
+  `JavaScriptExecutionDisabled` error instead of loading V8 on demand.
+
+Related: fuzz-related V8 flags passed via `ISOLATE_V8_FLAGS` (`--jit-fuzzing`,
+`--experimental-fuzzing`, `--randomize-hashes`) are dropped by default
+because they break UDF determinism; set `V8_ALLOW_FUZZING_FLAGS=true` to keep
+them for local runtime fuzzing.
+
 ## What exists
 
 A complete, tested WASM execution engine in `crates/wasm_runner`, a Rust
@@ -50,12 +70,19 @@ implement the guest side. See `crates/wasm_runner/src/abi.rs`.
 |---|---|---|---|
 | Rust | **Working** | `wasm32-wasip1`, `cargo build` | `#[convex_functions]` + `#[query]`/`#[mutation]`/`#[action]` macros |
 | Go | **Working** | native Go `GOOS=wasip1 GOARCH=wasm -buildmode=c-shared` (Go ≥ 1.24) | `//go:wasmexport` + `//go:wasmimport`; `_initialize` called by the runner |
+| C / C++ (game dev) | **Working** | stock LLVM clang `--target=wasm32-wasip1 -nostdlib` | Freestanding guest (`tests/fixtures/c_guest/guest.c`): no libc, no WASI imports needed; the same ABI serves C++ engines, Zig (`-target wasm32-wasip1`), AssemblyScript, and Rust with `no_std`. Import `env` functions, export `__convex_run`/`__convex_functions` |
+| Dart / Flutter | **Not viable (yet)** | — | Dart's official wasm output (`dart compile wasm`) targets wasm GC (WasmGC), which wasmtime 47 does not support; Flutter mobile stays on Dart AOT native. A WasmGC-capable engine upgrade (wasmtime ≥ 27 with `gc` feature) is the prerequisite; the ABI itself is unaffected since GC is a module-internal concern |
 | Kotlin | **Not viable** | — | Kotlin/Native dropped its wasm target; Kotlin/Wasm is beta, command-only, no export ABI, depends on wasm GC which wasmtime does not fully support |
 
 Go note: the runner calls `_initialize` before dispatch (required by the Go
 runtime), and registers WASI via `add_to_linker_async` so Go's runtime init
 (`fd_fdstat_get`, `poll_oneoff`, ...) doesn't hit wasmtime-wasi's blocking
 `in_tokio` path inside the async embedding.
+
+C note: the runner validates that modules only import `env` + WASI; a
+freestanding C guest imports only `env`, so it is the smallest and fastest
+guest (no runtime init, no GC, no WASI), on par with the Rust guest's
+single-digit-µs execution cost.
 
 ### Verification
 
@@ -80,7 +107,8 @@ host-function setup, execution, result parse, and teardown — the wasm
 execution itself is single-digit microseconds. Go is ~12× slower because a
 fresh `Store` per call runs the full Go runtime initialization
 (`_initialize`, GC setup). A per-module store pool would close most of the
-gap (see "Future work").
+gap (see "Future work"). A freestanding C guest has no runtime init, so it
+lands at the Rust guest's end of the spectrum.
 
 ## Limitations (v1)
 
