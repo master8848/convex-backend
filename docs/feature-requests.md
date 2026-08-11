@@ -1,0 +1,87 @@
+# Feature Requests: What Convex users are asking for (2025–2026)
+
+**Repo:** `get-convex/convex-backend` (self-hosted Convex backend: functions runtime, database/transactions,
+sync/realtime, auth, file storage, crons, WASM multi-language functions, HTTP actions, search)
+
+**Method**
+- GitHub API (authenticated `gh`): all 148 open + 93 closed issues in `get-convex/convex-backend`
+  (the active public tracker; `convex-dev/convex` is the unrelated legacy Clojure project and was excluded),
+  ranked by 👍 reactions and comment activity.
+- `ship.convex.dev` — Convex's official feature-request portal (backer counts, "What's next" board, changelog).
+- Official Convex blog/news (`news.convex.dev`, `stack.convex.dev`) + roadmap posts (2024–2026).
+- Cross-checked every candidate against this repo: `docs/`, `crates/*`, `git log --oneline -60`.
+
+Sources in the table: `#NN` = GitHub issue in get-convex/convex-backend; `ship #NNN` = ship.convex.dev request.
+
+---
+
+## Prioritized feature table (backend-buildable, top ~12)
+
+| # | Feature | Why users want it (evidence) | Complexity | Already in repo? | Priority |
+|---|---------|------------------------------|------------|------------------|----------|
+| 1 | **OpenTelemetry (OTel) trace export / OTel component** | #244 (20👍 — highest-voted backend-scoped request), #453 "Otel Tracing in Convex DB". Self-hosters want spans across services; today only webhook log streams exist | M | **No** — repo has `fastrace` internally + tracy + prometheus metrics, but **no OTLP/OTel exporter** and no user-facing trace export | **High** |
+| 2 | **Vector search: `q.and` + richer filter operators** | #324: "Being able to `q.and(q.eq(), q.eq())` for vector search would be really useful" — must pick one selective filter + massive top-K today | S–M | **No** — `crates/vector/src/query.rs` explicitly supports only `q.eq`/`q.or` ("Filters should be a combination of `q.eq` and `q.or`") | **High** (best value/effort) |
+| 3 | **BYO-ID / custom document IDs** | Official Convex blog (Dec 2025, "Why ctx.db is changing"): providing your own IDs "has been a longstanding request, and one we've wanted to support for years"; the new `db.get(table, id)` API "paves the way for BYO-ID" (offline apps, migrations from other DBs) | M–H | **No** — ID encoding still table-embedded (`value::DeveloperDocumentId`); no user-supplied-ID path | **High** |
+| 4 | **Table & column rename** | #342 (6👍): "Renaming columns or tables requires a flow like add-new-field + migrate + remove-old-field... I need to change `lead` to `client`" | M–H | **No** — `crates/database/src/table_registry.rs`: *"Table renames currently unsupported"* | **High** |
+| 5 | **Longer-running actions** | ship #237 (11 backers): "Allow actions to run for substantially longer durations so teams can handle heavy imports, large batch jobs, and slow third-party integrations" | M | **No** — execution limits exist in the runtime; raising/configuring max action duration is unplumbed for self-hosters | **Med-High** |
+| 6 | **Selective field retrieval / projection in queries** | #97 (6👍): queries re-run reactively when *any* field changes even if the client only uses a subset; want field selection/omission to cut bandwidth + reactivity | M | **No** — queries/subscriptions return whole documents | **Med** |
+| 7 | **`use node` (Node runtime) inside components** | #335 + ship #305 (planned): components today run in the V8 isolate; actions that need Node (fs, child_process, npm deps) can't live inside a component | M | **No** — `node_executor` + components both exist; wiring node execution into components is missing | **Med** |
+| 8 | **MCP server: schema-aware CRUD + file storage + scheduled functions** | #410: "the current MCP server is a great foundation... schema-aware CRUD tools + file storage + scheduled functions would make the Convex MCP experience significantly more powerful for AI agents (Claude Code, Cursor)" | S–M | **Partly** — MCP tools exist in the CLI (`npm-packages/convex/src/cli/lib/mcp/tools/`: data read, tables, logs, run, env); **no write/CRUD, storage, or cron tools** | **Med** |
+| 9 | **`at+jwt` (RFC 9068) token support** | #75 (32 comments — very active): "Support JWT with the `at+jwt` type (OIDC standard). For example: Logto access tokens are `at+jwt` tokens"; also unblocks #158 | S | **No** — `crates/authentication` verifies `Bearer` JWTs (RS256 for Clerk/Auth0/WorkOS); `at+jwt` scheme not accepted | **Med** (small, unblocks #10) |
+| 10 | **Logto as officially supported auth provider** | #158 (10👍): Logto is a top-5 open-source identity server (SSO, RBAC, multi-tenancy free); users want it "alongside Clerk and Auth0" | S–M | **Partly** — generic RS256 JWT verification exists; no Logto config/docs/component in repo | **Med** |
+| 11 | **Delete-all-records / reset-database API** | #476: "I am having a hard time trying to figure out how to reset the database without completely deleting the docker volume. Ideally there should be an API/CLI to wipe out all data" | S–M | **Partly** — `exports` + `snapshot_import` exist; no truncate/clear-table backend API or CLI | **Med** |
+| 12 | **Streaming export: before/after images for update/delete** | #316: streaming export should include data before and after for update/delete (change-data-capture parity) | S–M | **No** — `crates/streaming_export`: `SyncEntry` has only `Document` (latest) + `Tombstone` | **Med-Low** |
+| 13 | **Client TLS certificates in `fetch()` (mTLS)** | #331: "Would be beneficial for auth to services that require it... current workaround is falling back to `node:https`" | M | **No** — `crates/http_client` has no cert/mTLS options | **Med-Low** |
+| 14 | **Bun runtime for actions** | #279: "Is there a plan to support bun runtime? Inspired by next.js support of bun runtime" (faster cold starts, no Node install) | M | **No** — `node_executor` spawns Node only | **Low-Med** |
+
+### High-demand items that are OUT of backend scope (noted, not ranked)
+- **Flutter/Dart support** #54 (43👍, highest-voted overall) — client SDK work (convex-dart), not this backend.
+- **Biome support** #264 (13👍) — linting/tooling + docs (Convex already sponsors Biome).
+- **Rust backend functions** #334 — **already shipped in this repo** (WASM multi-language: `crates/wasm_runner`, Rust `convex_sdk` guest SDK, Go, C/C++, Kotlin, Dart guests).
+- **Data sync / streaming export API** ship #379 — **already in repo** (`crates/streaming_export`, "Public streaming-export ('data sync') API").
+- **Deployment-level usage limits** ship #367 — **already in repo** (`crates/usage_limits`, `crates/usage_tracking`; feature flag removed).
+- **Export/Import tab** #105 — **already in repo** (`crates/exports`, `crates/application/src/snapshot_import` + dashboard).
+- **Query subscription dedup**, **splay crons / omit-minute cron**, **custom JWT auth** — already in repo (git: `088e30aae`, `[Splay Crons]` commits, RS256 JWT verification).
+- **Performance/benchmark tooling** #188 — mostly in repo (`crates/load_generator`, `crates/performance_stats`).
+- **Password/passkey login + MFA** ship #378, **Convex auth v2** ship #232 — auth v2 is in progress upstream; the OSS repo currently supports third-party JWT auth only.
+- **Pause-all-crons** #474, **dashboard navigation** ship #382, **schema visualization** ship #373 — dashboard scope.
+
+---
+
+## Top 5 to build next
+
+1. **OpenTelemetry trace export (OTel component)** — The single most-voted *backend* feature request
+   (#244: 20👍, plus #453). Self-hosted operators currently get webhook log streams and internal
+   `fastrace`/tracy spans, but no standard OTLP export, so they can't correlate Convex function
+   execution with the rest of their stack. Medium effort: add an OTLP exporter around the existing
+   `fastrace` instrumentation + document a log-stream-style sink config. Highest demand-to-fit ratio.
+
+2. **Vector search `q.and` + richer filters** — #324. The filter engine in `crates/vector` already
+   handles `q.eq`/`q.or`; extending the expression subset (`q.and`, `q.neq`, `q.lt/gt`, `q.in`)
+   makes embedding search usable for multi-property queries (e.g. "comments by author in a PR")
+   without huge top-K fetches. Small, well-contained, directly testable — a quick win that removes
+   a real daily pain for AI/RAG builders (Convex's core audience).
+
+3. **BYO-ID / custom document IDs** — Convex's own engineering blog calls it "a longstanding
+   request" and the Dec 2025 `db.get(table, id)` API change was explicitly the first step toward it.
+   Custom IDs unlock offline-first clients (optimistic IDs), migrations from other databases, and
+   idempotent imports. Backend work: decouple ID encoding from table IDs, accept user-provided IDs
+   in `insert`, extend validators (`v.id(...)`), and keep sync/realtime semantics. High strategic
+   value; medium-high effort.
+
+4. **Table & column rename** — #342. The repo literally errors with "Table renames currently
+   unsupported" (`table_registry.rs`); users hit this constantly once a product's vocabulary changes.
+   A safe rename = schema change + data/index rewrite + backfill inside a transaction, reusing the
+   existing `migrations_model`/`schema_registry` machinery. Medium-high effort but a flagship
+   "schema evolution" feature for a database product.
+
+5. **Longer-running actions** — ship #237 (11 backers). Self-hosters with heavy imports, batch jobs,
+   and slow third-party integrations hit the action wall. Medium effort: surface max-action-duration
+   as configuration, add progress/keepalive plumbing, and document limits — largely runtime/config
+   work in `function_runner` + `node_executor`.
+
+*Rationale for ordering:* 1–2 are the strongest demand×fit×effort points (top-voted request; tiny
+high-value change). 3–4 are flagship database features users explicitly ask for and that this repo
+currently cannot do (verified in code). 5 is a well-backed but broader runtime change that also
+touches resource accounting. Items 6–14 in the table are all reasonable follow-ups; items in the
+out-of-scope list are either client/tooling work or already present in this codebase.
