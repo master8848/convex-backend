@@ -3,8 +3,8 @@
 
 BUILD := build
 
-.PHONY: all rust go c cpp check clean
-all: rust go c cpp
+.PHONY: all rust go c cpp zig check clean
+all: rust go c cpp zig
 
 rust:
 	@mkdir -p $(BUILD)/rust
@@ -36,6 +36,14 @@ cpp:
 		-o $(BUILD)/cpp/wasm_guest_example.wasm cpp/guest.cpp
 	@echo "   ok: $(BUILD)/cpp/wasm_guest_example.wasm"
 
+zig:
+	@mkdir -p $(BUILD)/zig
+	@echo ">> building zig example (requires zig >= 0.16)"
+	@cd zig && zig build-exe guest.zig -target wasm32-wasi -mexec-model=reactor -O ReleaseSmall -fstrip \
+		--export=__convex_run --export=__convex_functions --name wasm_guest_example
+	@mv zig/wasm_guest_example.wasm $(BUILD)/zig/
+	@echo "   ok: $(BUILD)/zig/wasm_guest_example.wasm"
+
 # Report which toolchains are present and how to install the missing ones.
 check:
 	@echo "--- toolchain check ---"
@@ -47,8 +55,9 @@ check:
 		echo "clang(wasm): ok"; else echo "clang(wasm): MISSING (install LLVM clang, e.g. 'brew install llvm' — Apple clang lacks wasm targets)"; fi
 	@command -v dart >/dev/null && echo "dart:        ok (wasm GC guest: in progress)" || echo "dart:        not installed (needed for dart example once WasmGC lands)"
 	@command -v kotlinc >/dev/null && echo "kotlinc:     ok (wasmWasi guest: in progress)" || echo "kotlinc:     not installed (needed for kotlin example)"
+	@command -v zig >/dev/null && echo "zig:         ok ($$(zig version))" || echo "zig:         MISSING (install zig: https://ziglang.org/download)")
 
 clean:
 	@rm -rf $(BUILD)
-	@rm -rf rust/target go/wasm_guest_example.wasm
+	@rm -rf rust/target go/wasm_guest_example.wasm zig/wasm_guest_example.wasm
 	@echo "cleaned"

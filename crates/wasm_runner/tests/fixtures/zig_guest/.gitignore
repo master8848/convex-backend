@@ -1,0 +1,4 @@
+# Zig build output + the compiled guest module (needs a Zig toolchain); not checked in
+zig-cache/
+zig-out/
+*.wasm
