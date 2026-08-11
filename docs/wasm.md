@@ -68,11 +68,12 @@ implement the guest side. See `crates/wasm_runner/src/abi.rs`.
 
 | Language | Status | Toolchain | Notes |
 |---|---|---|---|
-| Rust | **Working** | `wasm32-wasip1`, `cargo build` | `#[convex_functions]` + `#[query]`/`#[mutation]`/`#[action]` macros |
-| Go | **Working** | native Go `GOOS=wasip1 GOARCH=wasm -buildmode=c-shared` (Go ≥ 1.24) | `//go:wasmexport` + `//go:wasmimport`; `_initialize` called by the runner |
-| C / C++ (game dev) | **Working** | stock LLVM clang `--target=wasm32-wasip1 -nostdlib` | Freestanding guest (`tests/fixtures/c_guest/guest.c`): no libc, no WASI imports needed; the same ABI serves C++ engines, Zig (`-target wasm32-wasip1`), AssemblyScript, and Rust with `no_std`. Import `env` functions, export `__convex_run`/`__convex_functions` |
-| Dart / Flutter | **Not viable (yet)** | — | Dart's official wasm output (`dart compile wasm`) targets wasm GC (WasmGC), which wasmtime 47 does not support; Flutter mobile stays on Dart AOT native. A WasmGC-capable engine upgrade (wasmtime ≥ 27 with `gc` feature) is the prerequisite; the ABI itself is unaffected since GC is a module-internal concern |
-| Kotlin | **Not viable** | — | Kotlin/Native dropped its wasm target; Kotlin/Wasm is beta, command-only, no export ABI, depends on wasm GC which wasmtime does not fully support |
+| Rust | ✅ **valid target** | `wasm32-wasip1`, `cargo build` | `#[convex_functions]` + `#[query]`/`#[mutation]`/`#[action]` macros; example: `examples/wasm-guests/rust` |
+| Go | ✅ **valid target** | native Go `GOOS=wasip1 GOARCH=wasm -buildmode=c-shared` (Go ≥ 1.24) | `//go:wasmexport` + `//go:wasmimport`; `_initialize` called by the runner; example: `examples/wasm-guests/go` |
+| C | ✅ **valid target** | stock LLVM clang `--target=wasm32-wasip1 -nostdlib` | Freestanding guest (no libc, no WASI): smallest/fastest. Fixture `tests/fixtures/c_guest/guest.c` + end-to-end test; example: `examples/wasm-guests/c` |
+| C++ | ✅ **valid target** | stock LLVM clang++ `--target=wasm32-wasip1 -nostdlib -fno-exceptions -fno-rtti` | Same ABI as C; freestanding C++ rules in `examples/wasm-guests/cpp` (no libc++, no guard vars, POD statics). Serves game engines, Zig, AssemblyScript, Rust `no_std` |
+| Dart / Flutter | ❌ **blocked (engine GC ✓)** | `dart compile wasm` → WasmGC | wasmtime 47 (in use here) already runs WasmGC modules (`examples/gc_spike.rs`: struct/array/i31/ref under the runner's exact Config), so the historical "wasmtime ≥ 27 with `gc`" prerequisite is met — but a stock Dart module still cannot run end-to-end: dart2wasm 3.12 emits *legacy* exception-handling instructions that wasmtime 47 rejects, and every module imports a JS host (`dart2wasm.*` helpers, `wasm:js-string` builtins, string-constant globals) with no standalone target in stable SDKs. Flutter mobile stays on Dart AOT native. See `docs/dart-guest.md` |
+| Kotlin | 🚧 **in progress** | Kotlin Multiplatform `wasmWasi` | `wasmWasi` (wasm32-wasip1) target under research — export-ABI story (`@WasmExport`/`@JsExport`) and toolchain being validated; Kotlin/Wasm (WasmGC) may also become viable given wasmtime 47 GC support |
 
 Go note: the runner calls `_initialize` before dispatch (required by the Go
 runtime), and registers WASI via `add_to_linker_async` so Go's runtime init
@@ -84,15 +85,34 @@ freestanding C guest imports only `env`, so it is the smallest and fastest
 guest (no runtime init, no GC, no WASI), on par with the Rust guest's
 single-digit-µs execution cost.
 
+### Examples, scaffolding & best practices
+
+- **Examples**: `examples/wasm-guests/` has a ready-to-build standalone guest
+  per language — `rust/`, `go/`, `c/`, `cpp/` (all ✅ valid targets) plus
+  `dart/` and `kotlin/` status stubs that land with the in-flight work.
+- **One-command build**: `make` in `examples/wasm-guests/` builds every
+  supported example; `make check` verifies your toolchains and explains how to
+  install what's missing.
+- **Scaffold a new guest**: `examples/wasm-guests/scaffold.sh <lang> <name>`
+  copies a pre-wired template (ABI imports/exports included) so you never start
+  from the raw ABI.
+- **Best practices**: `docs/wasm-best-practices.md` — determinism, the
+  host-allocated memory model, module shape, limits, the transaction model,
+  testing, per-language notes, and a deployment checklist.
+
 ### Verification
 
-- `crates/wasm_runner/tests/end_to_end.rs` builds real Rust and Go guests
-  and runs them against a real sqlite-backed `Database`: reads, writes,
-  table queries, error propagation, deterministic randomness, log lines,
-  and module analysis.
+- `crates/wasm_runner/tests/end_to_end.rs` builds real Rust, Go and C
+  guests (C++ joins the same suite) and runs them against a real
+  sqlite-backed `Database`: reads, writes, table queries, error propagation,
+  deterministic randomness, log lines, and module analysis. Toolchain-missing
+  guests are skipped gracefully.
 - `cargo bench -p wasm_runner --bench udf_bench` measures the full
   per-invocation path (module lookup, instantiate, host functions,
   execution, result parse) for a `SELECT`-like `echo` function.
+- `cargo run -p wasm_runner --example gc_spike` proves the engine's WasmGC
+  support (struct/array/i31/ref.eq) under the runner's exact Config — the
+  engine-side prerequisite for a future Dart guest.
 
 ## Benchmark results (2026-08, Apple Silicon)
 
@@ -205,5 +225,6 @@ lands at the Rust guest's end of the spectrum.
 - **Determinism**: mirror the isolate's ChaCha12 seed + virtual timestamp;
   wasmtime's NaN canonicalization and relaxed-SIMD disabling close the
   remaining nondeterminism sources.
-- **wasmtime 47 pinned**: latest with p1 core-module support, async
-  host functions, and per-store fuel/limits.
+- **wasmtime 47 pinned**: newest on crates.io at the time of writing; p1
+  core-module support, async host functions, per-store fuel/limits, and
+  WasmGC (`gc` is in the default feature set).

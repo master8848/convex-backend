@@ -579,6 +579,114 @@ fn test_c_guest_end_to_end() -> anyhow::Result<()> {
     })
 }
 
+/// Builds the freestanding C++ guest fixture and returns the compiled wasm
+/// bytes. Requires a clang++ that ships the `wasm32-wasip1` target (stock
+/// LLVM; Apple's system clang does not). Returns None if unavailable.
+fn build_cpp_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
+    let source = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cpp_guest/guest.cpp"
+    );
+    let output = std::process::Command::new("clang++")
+        .args([
+            "--target=wasm32-wasip1",
+            "-O3",
+            "-nostdlib",
+            "-fno-exceptions",
+            "-fno-rtti",
+            "-fno-threadsafe-statics",
+            "-Wl,--no-entry",
+            "-Wl,--export=__convex_run",
+            "-Wl,--export=__convex_functions",
+            "-Wl,--allow-undefined",
+            "-o",
+            "cpp_guest.wasm",
+            source,
+        ])
+        .current_dir(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/cpp_guest"
+        ))
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("Failed to run clang++ to build the C++ guest module"),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("No available targets are compatible")
+            || stderr.contains("unknown target")
+        {
+            eprintln!("clang++ lacks the wasm32-wasip1 target; skipping C++ guest test");
+            return Ok(None);
+        }
+        anyhow::bail!("clang++ build failed: {stderr}");
+    }
+    let wasm_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cpp_guest/cpp_guest.wasm",
+    );
+    std::fs::read(wasm_path)
+        .context("C++ guest module binary not found")
+        .map(Some)
+}
+
+#[test]
+fn test_cpp_guest_end_to_end() -> anyhow::Result<()> {
+    let tokio = ProdRuntime::init_tokio()?;
+    tokio.block_on(async {
+        let Some(module_binary) = build_cpp_guest_module()? else {
+            return anyhow::Ok(());
+        };
+        let runner = WasmRunner::new()?;
+        let rt = ProdRuntime::new(&tokio);
+        let (persistence, mut database) = new_database(&rt).await?;
+        database = create_table(&database, &persistence, &rt, "counters").await?;
+
+        // echo: a freestanding C++ guest (classes/templates/constexpr, no libc++).
+        let (_, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "echo",
+            serde_json::json!(["cpp hello"]),
+        )
+        .await?;
+        let value: PendingValue = result.result?.unpack()?;
+        assert_eq!(value.to_uncommitted_json(), serde_json::json!("cpp hello"));
+
+        // unknown function -> guest error, not a host panic.
+        let (_, result) = run_function(
+            &runner,
+            &module_binary,
+            &database,
+            "no_such_fn",
+            serde_json::json!([]),
+        )
+        .await?;
+        assert!(result.result.is_err());
+
+        // descriptor analysis
+        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let tx = database.begin(Identity::Unknown(None)).await?;
+        let functions = wasm_runner::analyze_functions(
+            &runner,
+            &module,
+            tx,
+            ComponentId::Root,
+            [7u8; 32],
+            UnixTimestamp::from_millis(1_700_000_000_000),
+            WasmLimits::default(),
+        )
+        .await?;
+        let names: Vec<_> = functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["echo"]);
+
+        anyhow::Ok(())
+    })
+}
+
 #[test]
 fn test_module_validation_rejects_bad_modules() -> anyhow::Result<()> {
     let tokio = ProdRuntime::init_tokio()?;
