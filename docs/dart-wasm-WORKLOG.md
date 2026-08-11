@@ -94,3 +94,28 @@ allowlist changes in wasm_runner.
   engine GC works (examples/gc_spike.rs) but Dart is blocked end-to-end by
   legacy EH instructions + JS host dependency (docs/dart-guest.md).
 - Final `cargo check -p wasm_runner` re-run after all edits.
+
+
+## Update 2026-08-11 — re-verification (docs/dart-feasibility-2026.md)
+
+Re-checked every claim via SDK source (dart.googlesource.com), Gerrit/GitHub
+issue state, crates.io, and vendored wasmtime 47.0.3 source. What changed:
+
+- **Standalone target is real now**: merged to SDK main 2026-06-02
+  (dart-review 506920; "standalone target … is feature-complete now",
+  exposes `dart compile wasm --standalone`); NOT in released 3.12.2 (tag
+  verified), but present in 3.13.0-282.4.beta (2026-08-04). Next stable (3.13)
+  ships it. Standalone modules import only `dart.*` host functions (≤82,
+  tree-shaken) — no JS glue, no wasm:js-string, no JSTag. #63166 closed
+  2026-07-29 (last JS bits removed from dart:_wasm).
+- **Legacy EH still blocks wasmtime**: even standalone `$invokeMain` is
+  try/catch+rethrow → every module has ≥1 legacy `try`; wasmtime 47 rejects.
+  Upstream switching: CL 505900 (try_table codegen) NEW rev 15 (2026-08-10);
+  plan = switch in stable ~Nov 2026 (3.14); wasm_builder already supports
+  try_table. wasmtime 47.0.3 still newest (2026-07-31).
+- **Workaround available today**: binaryen `wasm-opt --translate-to-exnref`
+  converts legacy Phase-3 EH → new encoding (unverified on dart2wasm output;
+  spike candidate).
+- Verdict: PARTIALLY. Prototype path exists now (3.13 beta --standalone +
+  wasm-opt translation + Rust `dart.*` shim + validation allowlist);
+  clean path when 3.13 stable (--standalone) and #54394 (new EH) land.
