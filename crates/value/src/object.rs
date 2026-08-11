@@ -189,6 +189,11 @@ impl ConvexObject {
             .expect("Filtering an object should always produce a smaller, thus valid object")
     }
 
+    /// Does the object have any system fields?
+    pub fn has_system_fields(&self) -> bool {
+        self.keys().any(|k| k.is_system())
+    }
+
     /// Returns a new object with the system fields removed.
     pub fn filter_system_fields(self) -> Self {
         self.filter_fields(|k| !k.is_system())

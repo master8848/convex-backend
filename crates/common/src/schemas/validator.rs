@@ -1,11 +1,15 @@
 use std::{
     borrow::Borrow,
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fmt::{
         self,
         Display,
     },
     iter,
+    sync::Arc,
 };
 
 use errors::ErrorMetadata;
@@ -169,7 +173,7 @@ impl Validator {
                     t.check_value_internal(
                         elt,
                         all_tables_number_to_name,
-                        context.with(format!("[{i}]")),
+                        context.with(ValidationContextSegment::Index(i)),
                     )?;
                 }
             },
@@ -178,43 +182,17 @@ impl Validator {
                     key_type.check_value_internal(
                         &ConvexValue::from(key.clone()),
                         all_tables_number_to_name,
-                        context.with(".keys()".to_string()),
+                        context.with(ValidationContextSegment::Keys),
                     )?;
                     value_type.check_value_internal(
                         value,
                         all_tables_number_to_name,
-                        context.with(".values()".to_string()),
+                        context.with(ValidationContextSegment::Values),
                     )?;
                 }
             },
             (Validator::Object(object_validator), ConvexValue::Object(object)) => {
-                for (field_name, field_type) in &object_validator.0 {
-                    let maybe_value = object.get::<str>(field_name.borrow());
-                    if let Some(value) = maybe_value {
-                        field_type.validator.check_value_internal(
-                            value,
-                            all_tables_number_to_name,
-                            context.with(format!(".{field_name}")),
-                        )?
-                    } else if !field_type.optional {
-                        return Err(ValidationError::MissingRequiredField {
-                            object: object.clone(),
-                            field_name: field_name.clone(),
-                            object_validator: object_validator.clone(),
-                            context,
-                        });
-                    }
-                }
-                for field in object.keys() {
-                    if !object_validator.0.contains_key::<str>(field.borrow()) {
-                        return Err(ValidationError::ExtraField {
-                            object: object.clone(),
-                            field_name: field.clone(),
-                            object_validator: object_validator.clone(),
-                            context,
-                        });
-                    }
-                }
+                object_validator.check_object(object, all_tables_number_to_name, context)?;
             },
             (Validator::Union(validators), value) => {
                 if validators.len() == 1 {
@@ -225,14 +203,45 @@ impl Validator {
                     );
                 }
 
-                // TODO: This is dropping the error messages from the individual
-                // validators. Maybe we should combine them if this fails?
+                // If every member is an object validator with a literal value
+                // for a shared field, dispatch directly to the member whose
+                // literal matches the value instead of trying each member in
+                // turn. The dispatched member is the only one that can match,
+                // so this accepts and rejects the same values as the loop
+                // below, though it reports the dispatched member's error.
+                if let ConvexValue::Object(object) = value
+                    && let Some((discriminator_field, literal_to_member)) =
+                        shared_literal_discriminator(validators)
+                    && let Some(literal_value) = object.get::<str>(discriminator_field.borrow())
+                    && let Some(member_index) = literal_to_member.get(literal_value)
+                {
+                    return validators[*member_index].check_value_internal(
+                        value,
+                        all_tables_number_to_name,
+                        context,
+                    );
+                }
+
+                // Collect the errors from each member so we can surface a more
+                // useful error than a generic no-match: if any member fails
+                // with a missing or extra field error, return the first such
+                // error. Otherwise keep the no-match error.
+                let mut member_errors = Vec::new();
                 for t in validators {
-                    if t.check_value_internal(value, all_tables_number_to_name, context.clone())
-                        .is_ok()
+                    match t.check_value_internal(value, all_tables_number_to_name, context.clone())
                     {
-                        return Ok(());
+                        Ok(()) => return Ok(()),
+                        Err(error) => member_errors.push(error),
                     }
+                }
+                if let Some(error) = member_errors.into_iter().find(|error| {
+                    matches!(
+                        error,
+                        ValidationError::MissingRequiredField { .. }
+                            | ValidationError::ExtraField { .. }
+                    )
+                }) {
+                    return Err(error);
                 }
                 return Err(ValidationError::NoMatch {
                     value: value.clone(),
@@ -682,29 +691,66 @@ impl From<Option<DocumentSchema>> for Validator {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValidationContextSegment {
+    Field(IdentifierFieldName),
+    Index(usize),
+    Keys,
+    Values,
+}
+
+impl Display for ValidationContextSegment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ValidationContextSegment::Field(field_name) => write!(f, ".{field_name}"),
+            ValidationContextSegment::Index(index) => write!(f, "[{index}]"),
+            ValidationContextSegment::Keys => write!(f, ".keys()"),
+            ValidationContextSegment::Values => write!(f, ".values()"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-pub struct ValidationContext(Option<String>);
+struct ValidationContextSegmentNode {
+    segment: ValidationContextSegment,
+    parent: Option<Arc<ValidationContextSegmentNode>>,
+}
+
+/// The path to the value being validated, built lazily. Context is only ever
+/// rendered into a string when an error is constructed, so the success path
+/// never pays for string allocation: each nesting level pushes a cheap owned
+/// segment onto a shared linked list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidationContext(Option<Arc<ValidationContextSegmentNode>>);
 
 impl ValidationContext {
     pub fn new() -> Self {
         ValidationContext(None)
     }
 
-    pub fn with(&self, new_context: String) -> Self {
-        match &self.0 {
-            Some(context) => Self(Some(format!("{context}{new_context}"))),
-            None => Self(Some(new_context)),
-        }
+    pub fn with(&self, segment: ValidationContextSegment) -> Self {
+        ValidationContext(Some(Arc::new(ValidationContextSegmentNode {
+            segment,
+            parent: self.0.clone(),
+        })))
     }
 }
 
 impl Display for ValidationContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(context) = &self.0 {
-            write!(f, "Path: {context}")
-        } else {
-            Ok(())
+            write!(f, "Path: ")?;
+            let mut segments = Vec::new();
+            let mut node = Some(context);
+            while let Some(current) = node {
+                segments.push(&current.segment);
+                node = current.parent.as_ref();
+            }
+            for segment in segments.into_iter().rev() {
+                write!(f, "{segment}")?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -794,6 +840,67 @@ pub enum AddTopLevelFields {
 }
 
 impl ObjectValidator {
+    /// Checks that the given object matches this object validator, without
+    /// cloning the validator into a `Validator::Object` wrapper.
+    pub fn check_object(
+        &self,
+        object: &ConvexObject,
+        all_tables_number_to_name: &impl Fn(TableNumber) -> anyhow::Result<TableName>,
+        context: ValidationContext,
+    ) -> Result<(), ValidationError> {
+        for (field_name, field_type) in &self.0 {
+            let maybe_value = object.get::<str>(field_name.borrow());
+            if let Some(value) = maybe_value {
+                field_type.validator.check_value_internal(
+                    value,
+                    all_tables_number_to_name,
+                    context.with(ValidationContextSegment::Field(field_name.clone())),
+                )?
+            } else if !field_type.optional {
+                return Err(ValidationError::MissingRequiredField {
+                    object: object.clone(),
+                    field_name: field_name.clone(),
+                    object_validator: self.clone(),
+                    context,
+                });
+            }
+        }
+        for field in object.keys() {
+            if !self.0.contains_key::<str>(field.borrow()) {
+                return Err(ValidationError::ExtraField {
+                    object: object.clone(),
+                    field_name: field.clone(),
+                    object_validator: self.clone(),
+                    context,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that the given value is an object and matches this object
+    /// validator. Equivalent to wrapping this validator in
+    /// `Validator::Object` and calling `check_value` on it.
+    pub fn check_value(
+        &self,
+        value: &ConvexValue,
+        table_mapping: &NamespacedTableMapping,
+        virtual_system_mapping: &VirtualSystemMapping,
+    ) -> Result<(), ValidationError> {
+        match value {
+            ConvexValue::Object(object) => {
+                let all_tables_number_to_name =
+                    all_tables_number_to_name(table_mapping, virtual_system_mapping);
+                self.check_object(object, &all_tables_number_to_name, ValidationContext::new())
+            },
+            _ => Err(ValidationError::NoMatch {
+                value: value.clone(),
+                validator: Validator::Object(self.clone()),
+                context: ValidationContext::new(),
+            }),
+        }
+    }
+
     pub fn has_validator_for_system_field(&self) -> bool {
         let fields = &self.0;
         fields.keys().any(|f| f.is_system())
@@ -850,6 +957,60 @@ impl ObjectValidator {
             .values()
             .flat_map(|field| field.validator.foreign_keys())
     }
+}
+
+/// If every validator in a union is an object validator with a literal
+/// validator for the same field, returns that field name and a map from
+/// literal value to member index. If two members share a literal, only the
+/// first is kept: the union still accepts a value with that literal as long
+/// as the first such member matches, so dispatching to it is correct.
+fn shared_literal_discriminator(
+    validators: &[Validator],
+) -> Option<(&IdentifierFieldName, HashMap<ConvexValue, usize>)> {
+    let mut common_fields: Option<Vec<&IdentifierFieldName>> = None;
+    for validator in validators {
+        let Validator::Object(ObjectValidator(fields)) = validator else {
+            return None;
+        };
+        let field_names: Vec<&IdentifierFieldName> = fields.keys().collect();
+        common_fields = Some(match common_fields {
+            None => field_names,
+            Some(previous) => previous
+                .into_iter()
+                .filter(|field| field_names.contains(field))
+                .collect(),
+        });
+    }
+    // Find the first common field whose validator is a literal in every
+    // member. Building the map only scans field headers, unlike member checks
+    // which walk whole value trees, so it is rebuilt on every check call.
+    for field in common_fields? {
+        let mut literal_to_member = HashMap::new();
+        let mut all_literal = true;
+        for (index, validator) in validators.iter().enumerate() {
+            let Validator::Object(ObjectValidator(fields)) = validator else {
+                unreachable!("checked above");
+            };
+            match fields.get(field) {
+                Some(FieldValidator {
+                    validator: Validator::Literal(literal),
+                    ..
+                }) => {
+                    literal_to_member
+                        .entry(literal.clone().into())
+                        .or_insert(index);
+                },
+                _ => {
+                    all_literal = false;
+                    break;
+                },
+            }
+        }
+        if all_literal {
+            return Some((field, literal_to_member));
+        }
+    }
+    None
 }
 
 /// Object fields can be optional.
@@ -954,4 +1115,267 @@ Validator: {validator}"
         validator: Validator,
         context: ValidationContext,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use value::{
+        ConvexValue,
+        TableMapping,
+        TableNamespace,
+    };
+
+    use crate::{
+        obj,
+        schemas::validator::{
+            FieldValidator,
+            LiteralValidator,
+            ObjectValidator,
+            ValidationContext,
+            ValidationContextSegment,
+            ValidationError,
+            Validator,
+        },
+        val,
+        virtual_system_mapping::{
+            all_tables_number_to_name,
+            VirtualSystemMapping,
+        },
+    };
+
+    fn check(validator: &Validator, value: &ConvexValue) -> Result<(), ValidationError> {
+        validator.check_value(
+            value,
+            &TableMapping::new().namespace(TableNamespace::Global),
+            &VirtualSystemMapping::default(),
+        )
+    }
+
+    fn literal_string(value: &str) -> Validator {
+        Validator::Literal(LiteralValidator::String(
+            value.try_into().expect("valid string literal"),
+        ))
+    }
+
+    fn required(validator: Validator) -> FieldValidator {
+        FieldValidator::required_field_type(validator)
+    }
+
+    fn discriminated_union() -> anyhow::Result<Validator> {
+        Ok(Validator::Union(vec![
+            Validator::Object(object_validator!(
+                "kind" => required(literal_string("circle")),
+                "radius" => required(Validator::Float64),
+            )),
+            Validator::Object(object_validator!(
+                "kind" => required(literal_string("square")),
+                "side" => required(Validator::Float64),
+            )),
+        ]))
+    }
+
+    #[test]
+    fn test_validation_context_renders_path_segments() {
+        let context = ValidationContext::new()
+            .with(ValidationContextSegment::Field("field".parse().unwrap()))
+            .with(ValidationContextSegment::Index(3))
+            .with(ValidationContextSegment::Keys)
+            .with(ValidationContextSegment::Values)
+            .with(ValidationContextSegment::Field("nested".parse().unwrap()));
+        assert_eq!(
+            context.to_string(),
+            "Path: .field[3].keys().values().nested"
+        );
+        assert_eq!(ValidationContext::new().to_string(), "");
+    }
+
+    #[test]
+    fn test_object_validator_check_value() -> anyhow::Result<()> {
+        let validator = ObjectValidator(
+            [
+                ("a".parse()?, required(Validator::Int64)),
+                (
+                    "b".parse()?,
+                    FieldValidator::optional_field_type(Validator::String),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let ok_value = val!({ "a" => 5 });
+        assert!(validator
+            .check_value(
+                &ok_value,
+                &TableMapping::new().namespace(TableNamespace::Global),
+                &VirtualSystemMapping::default(),
+            )
+            .is_ok());
+
+        let missing_value = val!({});
+        let error = validator
+            .check_value(
+                &missing_value,
+                &TableMapping::new().namespace(TableNamespace::Global),
+                &VirtualSystemMapping::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ValidationError::MissingRequiredField { .. }
+        ));
+
+        let extra_value = val!({ "a" => 5, "c" => 1 });
+        let error = validator
+            .check_value(
+                &extra_value,
+                &TableMapping::new().namespace(TableNamespace::Global),
+                &VirtualSystemMapping::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, ValidationError::ExtraField { .. }));
+
+        let non_object = val!(5);
+        let error = validator
+            .check_value(
+                &non_object,
+                &TableMapping::new().namespace(TableNamespace::Global),
+                &VirtualSystemMapping::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, ValidationError::NoMatch { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_object_validator_check_object_reports_path() -> anyhow::Result<()> {
+        let validator = ObjectValidator(
+            [(
+                "a".parse()?,
+                required(Validator::Object(ObjectValidator(
+                    [
+                        ("b".parse()?, required(Validator::Int64)),
+                        (
+                            "c".parse()?,
+                            required(Validator::Literal(LiteralValidator::String(
+                                "x".try_into()?,
+                            ))),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ))),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mapping = all_tables_number_to_name(
+            &TableMapping::new().namespace(TableNamespace::Global),
+            &VirtualSystemMapping::default(),
+        );
+        // A missing required field reports the path of the object that is
+        // missing it, i.e. without the missing field's own segment.
+        let object: value::ConvexObject = obj!("a" => {})?;
+        let error = validator
+            .check_object(&object, &mapping, ValidationContext::new())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ValidationError::MissingRequiredField { .. }
+        ));
+        assert!(error.to_string().contains("Path: .a"));
+
+        // A nested value mismatch reports the full path to the value.
+        let object: value::ConvexObject = obj!("a" => { "b" => 5, "c" => "y" })?;
+        let error = validator
+            .check_object(&object, &mapping, ValidationContext::new())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ValidationError::LiteralValuesDoNotMatch { .. }
+        ));
+        assert!(error.to_string().contains("Path: .a.c"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_dispatches_on_shared_literal() -> anyhow::Result<()> {
+        let union = discriminated_union()?;
+        // Matches the "square" member even though the first member fails.
+        let value = val!({ "kind" => "square", "side" => 2.0 });
+        assert!(check(&union, &value).is_ok());
+
+        let value = val!({ "kind" => "circle", "radius" => 1.0 });
+        assert!(check(&union, &value).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_dispatch_reports_dispatched_member_error() -> anyhow::Result<()> {
+        let union = Validator::Union(vec![
+            Validator::Object(object_validator!(
+                "kind" => required(literal_string("circle")),
+            )),
+            Validator::Object(object_validator!(
+                "kind" => required(literal_string("square")),
+                "side" => required(literal_string("x")),
+            )),
+        ]);
+        // Dispatches directly to the "square" member, so its error is
+        // reported instead of the union's generic NoMatch.
+        let value = val!({ "kind" => "square", "side" => "y" });
+        let error = check(&union, &value).unwrap_err();
+        assert!(matches!(
+            error,
+            ValidationError::LiteralValuesDoNotMatch { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_falls_back_without_discriminator() -> anyhow::Result<()> {
+        let union = discriminated_union()?;
+        // Not an object: falls back to the loop, which reports NoMatch.
+        let value = val!(5);
+        let error = check(&union, &value).unwrap_err();
+        assert!(matches!(error, ValidationError::NoMatch { .. }));
+
+        // Lacks the discriminator field: falls back to the loop, which
+        // reports the first member's missing-field error.
+        let value = val!({ "radius" => 1.0 });
+        let error = check(&union, &value).unwrap_err();
+        assert!(matches!(
+            error,
+            ValidationError::MissingRequiredField { .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_reports_first_missing_field_error() -> anyhow::Result<()> {
+        let union = Validator::Union(vec![
+            Validator::Object(object_validator!(
+                "kind" => required(literal_string("circle")),
+                "x" => required(Validator::Int64),
+            )),
+            Validator::String,
+        ]);
+        let value = val!({ "kind" => "circle" });
+        let error = check(&union, &value).unwrap_err();
+        match error {
+            ValidationError::MissingRequiredField { field_name, .. } => {
+                assert_eq!(field_name.to_string(), "x")
+            },
+            e => panic!("unexpected error: {e}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_reports_no_match_when_no_member_is_close() -> anyhow::Result<()> {
+        let union = Validator::Union(vec![Validator::Int64, Validator::Boolean]);
+        let value = val!("string");
+        let error = check(&union, &value).unwrap_err();
+        assert!(matches!(error, ValidationError::NoMatch { .. }));
+        Ok(())
+    }
 }

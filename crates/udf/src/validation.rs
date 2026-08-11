@@ -682,7 +682,7 @@ impl ValidatedPathAndArgs {
         // validator, check that they match.
         let args_validation_error = match pending_args_policy {
             PendingArgsPolicy::Reject => {
-                let udf_args = match parse_udf_args(&path.udf_path, args.clone().into_args()?) {
+                let udf_args = match parse_udf_args(&path.udf_path, args.into_args()?) {
                     Ok(udf_args) => udf_args,
                     Err(err) => return Ok(Err(err)),
                 };
@@ -696,11 +696,10 @@ impl ValidatedPathAndArgs {
                 )?
             },
             PendingArgsPolicy::Allow => {
-                let udf_args =
-                    match parse_pending_udf_args(&path.udf_path, args.clone().into_args()?) {
-                        Ok(udf_args) => udf_args,
-                        Err(err) => return Ok(Err(err)),
-                    };
+                let udf_args = match parse_pending_udf_args(&path.udf_path, args.into_args()?) {
+                    Ok(udf_args) => udf_args,
+                    Err(err) => return Ok(Err(err)),
+                };
                 if let Err(err) = validate_pending_udf_args_size(&path.udf_path, &udf_args) {
                     return Ok(Err(err));
                 }

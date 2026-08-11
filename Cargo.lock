@@ -6813,6 +6813,7 @@ dependencies = [
  "humansize",
  "imbl",
  "keybroker",
+ "lru 0.18.0",
  "maplit",
  "metrics",
  "migrations_model",

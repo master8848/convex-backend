@@ -1,9 +1,14 @@
 use std::{
     collections::BTreeMap,
     mem,
+    num::NonZeroUsize,
     ops::Deref,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        LazyLock,
+        Mutex,
+    },
 };
 
 use async_lru::async_lru::SizedValue;
@@ -17,6 +22,7 @@ use common::{
     },
 };
 use errors::ErrorMetadata;
+use lru::LruCache;
 use serde::{
     Deserialize,
     Serialize,
@@ -288,6 +294,42 @@ pub struct AnalyzedFunction {
     pub returns_str: Option<String>,
 }
 
+const VALIDATOR_CACHE_CAPACITY: usize = 1000;
+
+static ARGS_VALIDATOR_CACHE: LazyLock<Mutex<LruCache<String, Arc<ArgsValidator>>>> =
+    LazyLock::new(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(VALIDATOR_CACHE_CAPACITY).expect("non-zero cache capacity"),
+        ))
+    });
+
+static RETURNS_VALIDATOR_CACHE: LazyLock<Mutex<LruCache<String, Arc<ReturnsValidator>>>> =
+    LazyLock::new(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(VALIDATOR_CACHE_CAPACITY).expect("non-zero cache capacity"),
+        ))
+    });
+
+/// Parse a JSON-serialized validator, memoizing on the schema string. The
+/// same schema JSON repeats across calls and deployments, so this avoids
+/// re-parsing it on every UDF invocation. Failures aren't cached so the error
+/// path behaves identically to a direct parse.
+fn cached_json_deserialize<T: Clone>(
+    cache: &LazyLock<Mutex<LruCache<String, Arc<T>>>>,
+    json: &str,
+    parse: fn(&str) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if let Some(validator) = cache.lock().expect("validator cache poisoned").get(json) {
+        return Ok((**validator).clone());
+    }
+    let validator = Arc::new(parse(json)?);
+    cache
+        .lock()
+        .expect("validator cache poisoned")
+        .put(json.to_string(), validator.clone());
+    Ok((*validator).clone())
+}
+
 impl AnalyzedFunction {
     pub fn new(
         name: FunctionName,
@@ -311,14 +353,22 @@ impl AnalyzedFunction {
 
     pub fn args(&self) -> anyhow::Result<ArgsValidator> {
         match &self.args_str {
-            Some(args) => ArgsValidator::json_deserialize(args),
+            Some(args) => cached_json_deserialize(
+                &ARGS_VALIDATOR_CACHE,
+                args,
+                ArgsValidator::json_deserialize,
+            ),
             None => Ok(ArgsValidator::Unvalidated),
         }
     }
 
     pub fn returns(&self) -> anyhow::Result<ReturnsValidator> {
         match &self.returns_str {
-            Some(returns) => ReturnsValidator::json_deserialize(returns),
+            Some(returns) => cached_json_deserialize(
+                &RETURNS_VALIDATOR_CACHE,
+                returns,
+                ReturnsValidator::json_deserialize,
+            ),
             None => Ok(ReturnsValidator::Unvalidated),
         }
     }

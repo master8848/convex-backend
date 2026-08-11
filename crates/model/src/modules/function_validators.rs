@@ -58,11 +58,8 @@ impl ArgsValidator {
                     return Ok(Some(JsError::from_message(error_message)));
                 }
 
-                let validation_error = Validator::Object(object_validator.clone()).check_value(
-                    single_arg,
-                    table_mapping,
-                    virtual_system_mapping,
-                );
+                let validation_error =
+                    object_validator.check_value(single_arg, table_mapping, virtual_system_mapping);
                 if let Err(error) = validation_error {
                     Some(JsError::from_message(error.to_string()))
                 } else {

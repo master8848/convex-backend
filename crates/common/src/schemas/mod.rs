@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{
         BTreeMap,
         BTreeSet,
@@ -30,6 +31,7 @@ use value::{
 
 use self::validator::{
     ObjectValidator,
+    ValidationContext,
     ValidationError,
     Validator,
 };
@@ -47,7 +49,10 @@ use crate::{
         IndexDescriptor,
         TableName,
     },
-    virtual_system_mapping::VirtualSystemMapping,
+    virtual_system_mapping::{
+        all_tables_number_to_name,
+        VirtualSystemMapping,
+    },
 };
 
 pub mod json;
@@ -604,16 +609,33 @@ impl DocumentSchema {
         match self {
             DocumentSchema::Any => {},
             DocumentSchema::Union(t) => {
-                let value = value.clone().filter_system_fields();
-                let schema_type = t
-                    .iter()
-                    .map(|obj_schema| Validator::Object(obj_schema.clone()))
-                    .collect();
-                Validator::Union(schema_type).check_value(
-                    &ConvexValue::Object(value),
-                    table_mapping,
-                    virtual_system_mapping,
-                )?;
+                let all_tables_number_to_name =
+                    all_tables_number_to_name(table_mapping, virtual_system_mapping);
+                // Union members are already filtered of system fields at parse
+                // time, so only the value needs filtering, and only when it
+                // actually has system fields.
+                let value = if value.has_system_fields() {
+                    Cow::Owned(value.clone().filter_system_fields())
+                } else {
+                    Cow::Borrowed(value)
+                };
+                for obj_schema in t {
+                    if obj_schema
+                        .check_object(&value, &all_tables_number_to_name, ValidationContext::new())
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                return Err(ValidationError::NoMatch {
+                    value: ConvexValue::Object(value.into_owned()),
+                    validator: Validator::Union(
+                        t.iter()
+                            .map(|obj_schema| Validator::Object(obj_schema.clone()))
+                            .collect(),
+                    ),
+                    context: ValidationContext::new(),
+                });
             },
         }
         Ok(())

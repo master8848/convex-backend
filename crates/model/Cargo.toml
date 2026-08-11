@@ -49,6 +49,7 @@ futures-async-stream = { workspace = true }
 humansize = { workspace = true }
 imbl = { workspace = true }
 keybroker = { workspace = true }
+lru = { workspace = true }
 maplit = { workspace = true }
 metrics = { workspace = true }
 migrations_model = { workspace = true }
