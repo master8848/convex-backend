@@ -1,0 +1,7 @@
+# Gradle + Kotlin build output
+.gradle/
+build/
+.kotlin/
+
+# The compiled guest module is generated; not checked in (needs a Kotlin toolchain).
+*.wasm
