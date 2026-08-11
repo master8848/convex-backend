@@ -24,6 +24,16 @@ use anyhow::{
     Error,
     Result,
 };
+use serde::{
+    de::{
+        DeserializeSeed,
+        Error as DeError,
+        MapAccess,
+        SeqAccess,
+        Visitor,
+    },
+    Deserializer,
+};
 use serde_json::Value as JsonValue;
 
 use crate::{
@@ -36,7 +46,9 @@ use crate::{
     object::ConvexObject,
     walk::ConvexValueType,
     ConvexArray,
+    ConvexString,
     ConvexValue,
+    FieldName,
 };
 
 pub mod value {
@@ -322,12 +334,312 @@ impl ConvexArray {
     }
 }
 
+/// Deserialize a [`ConvexValue`] from its internal JSON encoding, parsing
+/// straight from the JSON text into the value tree.
+///
+/// This mirrors the semantics of `ConvexValue::try_from(JsonValue)` (including
+/// the `$integer`/`$bytes`/`$float` wrappers) but avoids materializing the
+/// intermediate `serde_json::Value` tree, halving the number of allocations on
+/// per-document decode paths (SQLite/Postgres/MySQL storage backends, sync
+/// protocol messages, ...).
 pub fn json_deserialize_bytes(s: &[u8]) -> anyhow::Result<ConvexValue> {
-    let v: serde_json::Value = serde_json::from_slice(s)?;
-    v.try_into()
+    let mut deserializer = serde_json::Deserializer::from_slice(s);
+    let value = InternalJsonValueSeed.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
 }
 
+/// Deserialize a [`ConvexValue`] from its internal JSON encoding, parsing
+/// straight from the JSON text into the value tree. See
+/// [`json_deserialize_bytes`].
 pub fn json_deserialize(s: &str) -> anyhow::Result<ConvexValue> {
-    let v: serde_json::Value = serde_json::from_str(s)?;
-    v.try_into()
+    let mut deserializer = serde_json::Deserializer::from_str(s);
+    let value = InternalJsonValueSeed.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+/// Deserialize a `ConvexValue` from a serde deserializer (typically
+/// `serde_json`), handling the internal JSON wrappers.
+struct InternalJsonValueSeed;
+
+impl<'de> DeserializeSeed<'de> for InternalJsonValueSeed {
+    type Value = ConvexValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(InternalJsonValueVisitor)
+    }
+}
+
+struct InternalJsonValueVisitor;
+
+impl<'de> Visitor<'de> for InternalJsonValueVisitor {
+    type Value = ConvexValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a ConvexValue in internal JSON format")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(ConvexValue::Null)
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(ConvexValue::Boolean(v))
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        // JSON numbers are all mapped to Float64, matching
+        // `serde_json::Number::as_f64` on the number path.
+        Ok(ConvexValue::Float64(v as f64))
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(ConvexValue::Float64(v as f64))
+    }
+
+    fn visit_f64<E>(self, v: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(ConvexValue::Float64(v))
+    }
+
+    fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(ConvexValue::String(
+            ConvexString::try_from(v).map_err(E::custom)?,
+        ))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(InternalJsonValueSeed)? {
+            values.push(value);
+        }
+        Ok(ConvexValue::Array(
+            values.try_into().map_err(A::Error::custom)?,
+        ))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        // Collect the raw entries first (last duplicate key wins, matching
+        // `serde_json::Map`), then apply the same single-key `$`-wrapper logic
+        // as `ConvexValue::try_from(JsonValue)`.
+        let mut fields: BTreeMap<String, ConvexValue> = BTreeMap::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = map.next_value_seed(InternalJsonValueSeed)?;
+            fields.insert(key, value);
+        }
+        if fields.len() == 1 {
+            let (key, value) = fields.into_iter().next().expect("checked len == 1");
+            match key.as_str() {
+                "$bytes" => {
+                    let s = string_from_value(value, "$bytes").map_err(A::Error::custom)?;
+                    Ok(ConvexValue::Bytes(
+                        JsonBytes::decode(s).map_err(A::Error::custom)?,
+                    ))
+                },
+                "$integer" => {
+                    let s = string_from_value(value, "$integer").map_err(A::Error::custom)?;
+                    Ok(ConvexValue::Int64(
+                        JsonInteger::decode(s).map_err(A::Error::custom)?,
+                    ))
+                },
+                "$float" => {
+                    let s = string_from_value(value, "$float").map_err(A::Error::custom)?;
+                    let n = JsonFloat::decode(s).map_err(A::Error::custom)?;
+                    // Float64s encoded as a $float object must not fit into a regular
+                    // `number`.
+                    if !is_negative_zero(n)
+                        && let FpCategory::Normal | FpCategory::Subnormal = n.classify()
+                    {
+                        return Err(A::Error::custom(format!(
+                            "Float64 {n} should be encoded as a number"
+                        )));
+                    }
+                    Ok(ConvexValue::Float64(n))
+                },
+                _ => {
+                    let key: FieldName = key.parse().map_err(A::Error::custom)?;
+                    Ok(ConvexValue::Object(
+                        ConvexObject::for_value(key, value).map_err(A::Error::custom)?,
+                    ))
+                },
+            }
+        } else {
+            let mut object = BTreeMap::new();
+            for (key, value) in fields {
+                object.insert(key.parse().map_err(A::Error::custom)?, value);
+            }
+            Ok(ConvexValue::Object(
+                object.try_into().map_err(A::Error::custom)?,
+            ))
+        }
+    }
+}
+
+fn string_from_value(value: ConvexValue, wrapper: &str) -> anyhow::Result<String> {
+    match value {
+        ConvexValue::String(s) => Ok(String::from(s)),
+        _ => anyhow::bail!("expected a string for {wrapper} value"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        json_deserialize,
+        json_deserialize_bytes,
+    };
+    use crate::{
+        ConvexArray,
+        ConvexObject,
+        ConvexValue,
+    };
+
+    /// Round-trip every value through internal JSON, both via the JSON string
+    /// and via the bytes path.
+    fn round_trip(value: &ConvexValue) {
+        let json = value.json_serialize().unwrap();
+        let parsed = json_deserialize(&json).unwrap();
+        assert_eq!(&parsed, value, "str round-trip failed for {json}");
+        let parsed_bytes = json_deserialize_bytes(json.as_bytes()).unwrap();
+        assert_eq!(&parsed_bytes, value, "bytes round-trip failed for {json}");
+    }
+
+    #[test]
+    fn test_json_round_trip() {
+        let values = [
+            ConvexValue::Null,
+            ConvexValue::Boolean(true),
+            ConvexValue::Boolean(false),
+            ConvexValue::Int64(0),
+            ConvexValue::Int64(-1),
+            ConvexValue::Int64(i64::MAX),
+            ConvexValue::Int64(i64::MIN),
+            ConvexValue::Float64(0.0),
+            ConvexValue::Float64(-0.0),
+            ConvexValue::Float64(f64::NAN),
+            ConvexValue::Float64(f64::INFINITY),
+            ConvexValue::Float64(f64::NEG_INFINITY),
+            ConvexValue::Float64(3.14159),
+            ConvexValue::String("hello".try_into().unwrap()),
+            ConvexValue::Bytes(vec![0, 1, 2, 255].try_into().unwrap()),
+            ConvexValue::Array(vec![].try_into().unwrap()),
+            ConvexValue::Array(
+                vec![
+                    ConvexValue::Int64(1),
+                    ConvexValue::String("two".try_into().unwrap()),
+                    ConvexValue::Boolean(true),
+                    ConvexValue::Null,
+                ]
+                .try_into()
+                .unwrap(),
+            ),
+            ConvexValue::Object(ConvexObject::empty()),
+            ConvexValue::Object(
+                ConvexObject::for_value("key".parse().unwrap(), ConvexValue::Float64(1.5)).unwrap(),
+            ),
+        ];
+        for value in values {
+            round_trip(&value);
+        }
+    }
+
+    #[test]
+    fn test_json_deserialize_matches_try_from() {
+        // Cases that exercise the single-key `$` wrappers and the plain paths.
+        let cases = [
+            json!(null),
+            json!(true),
+            json!(1),
+            json!(-1),
+            json!(1.5),
+            json!("a string"),
+            json!([1, 2, 3]),
+            json!({"a": 1, "b": [true, null]}),
+            json!({"$integer": crate::json::integer::JsonInteger::encode(42)}),
+            json!({"$bytes": crate::json::bytes::JsonBytes::encode(&[1, 2, 3]).to_string()}),
+            json!({"$float": crate::json::float::JsonFloat::encode(f64::NAN)}),
+            json!({"$float": crate::json::float::JsonFloat::encode(-0.0)}),
+            json!({"single": "field"}),
+        ];
+        for case in cases {
+            let expected = ConvexValue::try_from(case.clone()).unwrap();
+            let actual = json_deserialize(&serde_json::to_string(&case).unwrap()).unwrap();
+            assert_eq!(actual, expected, "case: {case}");
+        }
+
+        // A `$`-prefixed key alongside other keys is not a valid field name and
+        // must be rejected by both the old JsonValue path and the direct path.
+        let mixed = json!({"$integer": crate::json::integer::JsonInteger::encode(7), "x": 1});
+        let mixed_json = serde_json::to_string(&mixed).unwrap();
+        assert!(ConvexValue::try_from(mixed).is_err());
+        assert!(json_deserialize(&mixed_json).is_err());
+    }
+
+    #[test]
+    fn test_json_deserialize_errors() {
+        // $float values that fit in a plain number must be rejected.
+        let bad_float = json!({"$float": crate::json::float::JsonFloat::encode(1.0)});
+        let err = json_deserialize(&serde_json::to_string(&bad_float).unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("should be encoded as a number"),
+            "unexpected error: {err}"
+        );
+
+        // Non-string payloads for $ wrappers must be rejected.
+        assert!(json_deserialize(r#"{"$bytes": 5}"#).is_err());
+        assert!(json_deserialize(r#"{"$integer": null}"#).is_err());
+
+        // Reserved `$` field names must be rejected.
+        assert!(json_deserialize(r#"{"$foo": 1}"#).is_err());
+
+        // Invalid base64 must be rejected.
+        assert!(json_deserialize(r#"{"$integer": "!!!"}"#).is_err());
+        assert!(json_deserialize(r#"{"$bytes": "!!!"}"#).is_err());
+    }
+
+    #[test]
+    fn test_json_deserialize_array_type() {
+        // `ConvexArray::try_from(JsonValue)` is a public API that must keep
+        // working through the same internal JSON encoding.
+        let arr = json!([1, "two", null]);
+        let expected = ConvexArray::try_from(arr).unwrap();
+        let parsed = json_deserialize("[1, \"two\", null]").unwrap();
+        assert_eq!(ConvexArray::try_from(parsed).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_json_deserialize_trailing_garbage() {
+        assert!(json_deserialize("1 2").is_err());
+        assert!(json_deserialize_bytes(b"null x").is_err());
+        assert!(json_deserialize("").is_err());
+    }
 }

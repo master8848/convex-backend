@@ -1,4 +1,3 @@
-use common::json::JsonForm as _;
 use model::{
     modules::function_validators::ReturnsValidator,
     virtual_system_mapping,
@@ -16,7 +15,7 @@ pub fn op_validate_returns<'b, P: OpProvider<'b>>(
     validator: String,
     function_result: String,
 ) -> anyhow::Result<JsonValue> {
-    let returns_validator = match ReturnsValidator::json_deserialize(&validator) {
+    let returns_validator = match ReturnsValidator::json_deserialize_cached(&validator) {
         Ok(v) => v,
         Err(json_error) => {
             let message =

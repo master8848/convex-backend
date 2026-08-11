@@ -88,6 +88,7 @@ use common::{
         Timestamp,
     },
     value::{
+        json_deserialize_bytes,
         ConvexValue,
         InternalDocumentId,
         TabletId,
@@ -922,7 +923,7 @@ impl PostgresReader {
         let ts = Timestamp::try_from(ts)?;
         let tablet_id_bytes: Vec<u8> = row.get(2);
         let binary_value: Vec<u8> = row.get(3);
-        let json_value: JsonValue = serde_json::from_slice(&binary_value)
+        let value: ConvexValue = json_deserialize_bytes(&binary_value)
             .context("Failed to deserialize database value")?;
 
         let deleted: bool = row.get(4);
@@ -931,7 +932,6 @@ impl PostgresReader {
         );
         let document_id = InternalDocumentId::new(table, internal_id);
         let document = if !deleted {
-            let value: ConvexValue = json_value.try_into()?;
             Some(ResolvedDocument::from_database(table, value)?)
         } else {
             None
@@ -1041,10 +1041,9 @@ impl PostgresReader {
                 let (ts, document_id, document, prev_ts) = self.row_to_document(row)?;
                 let prev_rev_document: Option<ResolvedDocument> = prev_rev_value
                     .map(|v| {
-                        let json_value: JsonValue = serde_json::from_slice(&v)
-                            .context("Failed to deserialize database value")?;
                         // N.B.: previous revisions should never be deleted, so we don't check that.
-                        let value: ConvexValue = json_value.try_into()?;
+                        let value: ConvexValue = json_deserialize_bytes(&v)
+                            .context("Failed to deserialize database value")?;
                         ResolvedDocument::from_database(document_id.table(), value)
                     })
                     .transpose()?;
@@ -1130,15 +1129,14 @@ impl PostgresReader {
                     json,
                     prev_ts,
                 } => {
-                    let json_value: JsonValue = serde_json::from_slice(&json)
+                    let value: ConvexValue = json_deserialize_bytes(&json)
                         .context("Failed to deserialize database value")?;
                     anyhow::ensure!(
-                        json_value != JsonValue::Null,
+                        value != ConvexValue::Null,
                         "Index reference to deleted document {:?} {:?}",
                         key,
                         ts
                     );
-                    let value: ConvexValue = json_value.try_into()?;
                     let document = ResolvedDocument::from_database(tablet_id, value)?;
                     yield (
                         key,

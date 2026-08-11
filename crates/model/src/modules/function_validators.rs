@@ -1,3 +1,12 @@
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        LazyLock,
+        Mutex,
+    },
+};
+
 use common::{
     errors::JsError,
     json::JsonForm,
@@ -8,6 +17,7 @@ use common::{
     virtual_system_mapping::VirtualSystemMapping,
 };
 use errors::ErrorMetadataAnyhowExt;
+use lru::LruCache;
 use serde::{
     Deserialize,
     Serialize,
@@ -19,6 +29,27 @@ use value::{
     PendingValue,
     MAX_COMMIT_TS,
 };
+
+/// Capacity of the per-process LRU caches for parsed args/returns validators.
+/// The validator JSON strings repeat across deployments and across every UDF
+/// invocation (the JS runtime passes `exportArgs()`/`exportReturns()` JSON to
+/// the `validateArgs`/`validateReturns` ops on each call), so memoizing the
+/// parse avoids re-allocating the validator tree on every call.
+const VALIDATOR_CACHE_CAPACITY: usize = 1000;
+
+static ARGS_VALIDATOR_CACHE: LazyLock<Mutex<LruCache<String, Arc<ArgsValidator>>>> =
+    LazyLock::new(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(VALIDATOR_CACHE_CAPACITY).expect("non-zero cache capacity"),
+        ))
+    });
+
+static RETURNS_VALIDATOR_CACHE: LazyLock<Mutex<LruCache<String, Arc<ReturnsValidator>>>> =
+    LazyLock::new(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(VALIDATOR_CACHE_CAPACITY).expect("non-zero cache capacity"),
+        ))
+    });
 
 /**
  * A validator for the arguments to a UDF.
@@ -84,6 +115,28 @@ impl ArgsValidator {
             .collect::<anyhow::Result<Vec<_>>>()
             .and_then(ConvexArray::try_from)?;
         self.check_args(&projected, table_mapping, virtual_system_mapping)
+    }
+
+    /// Parse a JSON-serialized args validator, memoizing on the schema string.
+    ///
+    /// The JS runtime passes the same `exportArgs()` JSON to the
+    /// `validateArgs` op on every UDF invocation, so this avoids re-parsing
+    /// the validator on each call. Failures aren't cached so the error path
+    /// behaves identically to a direct parse.
+    pub fn json_deserialize_cached(json: &str) -> anyhow::Result<Self> {
+        if let Some(validator) = ARGS_VALIDATOR_CACHE
+            .lock()
+            .expect("args validator cache poisoned")
+            .get(json)
+        {
+            return Ok((**validator).clone());
+        }
+        let validator = Arc::new(Self::json_deserialize(json)?);
+        ARGS_VALIDATOR_CACHE
+            .lock()
+            .expect("args validator cache poisoned")
+            .put(json.to_string(), validator.clone());
+        Ok((*validator).clone())
     }
 }
 
@@ -178,6 +231,24 @@ impl ReturnsValidator {
         let projected = output.resolve(MAX_COMMIT_TS)?;
         Ok(self.check_output(&projected, table_mapping, virtual_system_mapping))
     }
+
+    /// Parse a JSON-serialized returns validator, memoizing on the schema
+    /// string. See [`ArgsValidator::json_deserialize_cached`].
+    pub fn json_deserialize_cached(json: &str) -> anyhow::Result<Self> {
+        if let Some(validator) = RETURNS_VALIDATOR_CACHE
+            .lock()
+            .expect("returns validator cache poisoned")
+            .get(json)
+        {
+            return Ok((**validator).clone());
+        }
+        let validator = Arc::new(Self::json_deserialize(json)?);
+        RETURNS_VALIDATOR_CACHE
+            .lock()
+            .expect("returns validator cache poisoned")
+            .put(json.to_string(), validator.clone());
+        Ok((*validator).clone())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -212,5 +283,58 @@ impl TryFrom<ReturnsValidator> for ReturnsValidatorJson {
             ReturnsValidator::Unvalidated => Ok(Self(None)),
             ReturnsValidator::Validated(output_schema) => Ok(Self(Some(output_schema.try_into()?))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::json::JsonForm;
+
+    use super::{
+        ArgsValidator,
+        ReturnsValidator,
+    };
+
+    const OBJECT_VALIDATOR_JSON: &str = r#"{"type":"object","value":{}}"#;
+
+    #[test]
+    fn test_cached_args_validator_matches_direct_parse() {
+        let direct = ArgsValidator::json_deserialize(OBJECT_VALIDATOR_JSON).unwrap();
+        let cached = ArgsValidator::json_deserialize_cached(OBJECT_VALIDATOR_JSON).unwrap();
+        assert_eq!(direct, cached);
+        // A second cached parse must produce an equal validator.
+        let cached_again = ArgsValidator::json_deserialize_cached(OBJECT_VALIDATOR_JSON).unwrap();
+        assert_eq!(cached, cached_again);
+    }
+
+    #[test]
+    fn test_cached_returns_validator_matches_direct_parse() {
+        let direct = ReturnsValidator::json_deserialize(OBJECT_VALIDATOR_JSON).unwrap();
+        let cached = ReturnsValidator::json_deserialize_cached(OBJECT_VALIDATOR_JSON).unwrap();
+        assert_eq!(direct, cached);
+        let cached_again =
+            ReturnsValidator::json_deserialize_cached(OBJECT_VALIDATOR_JSON).unwrap();
+        assert_eq!(cached, cached_again);
+    }
+
+    #[test]
+    fn test_cached_validator_errors_are_not_cached() {
+        // A failed parse must not poison the cache for subsequent valid parses.
+        assert!(ArgsValidator::json_deserialize_cached("not json").is_err());
+        assert!(ReturnsValidator::json_deserialize_cached("not json").is_err());
+        let args = ArgsValidator::json_deserialize_cached(OBJECT_VALIDATOR_JSON).unwrap();
+        assert!(matches!(args, ArgsValidator::Validated(_)));
+        let returns = ReturnsValidator::json_deserialize_cached(OBJECT_VALIDATOR_JSON).unwrap();
+        assert!(matches!(returns, ReturnsValidator::Validated(_)));
+    }
+
+    #[test]
+    fn test_cached_validator_unvalidated() {
+        // `{"type":"any"}` (or `null` for returns) parses to the Unvalidated
+        // variants.
+        let args = ArgsValidator::json_deserialize_cached(r#"{"type":"any"}"#).unwrap();
+        assert!(matches!(args, ArgsValidator::Unvalidated));
+        let returns = ReturnsValidator::json_deserialize_cached("null").unwrap();
+        assert!(matches!(returns, ReturnsValidator::Unvalidated));
     }
 }

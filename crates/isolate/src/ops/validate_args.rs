@@ -1,4 +1,3 @@
-use common::json::JsonForm as _;
 use model::{
     modules::function_validators::ArgsValidator,
     virtual_system_mapping,
@@ -21,7 +20,7 @@ pub fn op_validate_args<'b, P: OpProvider<'b>>(
     validator: String,
     args: String,
 ) -> anyhow::Result<JsonValue> {
-    let args_validator = match ArgsValidator::json_deserialize(&validator) {
+    let args_validator = match ArgsValidator::json_deserialize_cached(&validator) {
         Ok(v) => v,
         Err(json_error) => {
             let message = format!("Unable to parse JSON returned from `exportArgs`: {json_error}");

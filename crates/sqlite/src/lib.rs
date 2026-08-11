@@ -53,7 +53,7 @@ use common::{
         Timestamp,
     },
     value::{
-        ConvexValue,
+        json_deserialize,
         InternalDocumentId,
         TabletId,
     },
@@ -180,8 +180,7 @@ impl SqlitePersistence {
             let json_value = json_value.ok_or_else(|| {
                 anyhow::anyhow!("Index reference to deleted document {:?} {:?}", key, ts)
             })?;
-            let json_value: serde_json::Value = serde_json::from_str(&json_value)?;
-            let value: ConvexValue = json_value.try_into()?;
+            let value = json_deserialize(&json_value)?;
             let document = ResolvedDocument::from_database(tablet_id, value)?;
             triples.push(Ok((
                 key,
@@ -658,8 +657,7 @@ fn row_to_document(
     let document = if !deleted {
         let json_value = json_value
             .ok_or_else(|| anyhow::anyhow!("Unexpected NULL json_value at {} {}", id, prev_ts))?;
-        let json_value: serde_json::Value = serde_json::from_str(&json_value)?;
-        let value: ConvexValue = json_value.try_into()?;
+        let value = json_deserialize(&json_value)?;
         Some(ResolvedDocument::from_database(table, value)?)
     } else {
         None
