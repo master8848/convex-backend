@@ -1,0 +1,42 @@
+{
+ "schema": 1,
+ "entries": {
+  "prompt": {
+   "disk_hygiene_check": {
+    "id": "disk_hygiene_check",
+    "kind": "prompt",
+    "title": "disk-hygiene-check",
+    "content": "At the end of every work session or turn (especially after builds/tests/subagent work), run a disk check: `df -h` on the data volume and `du -sh target` in the repo. If free space is below ~20 GiB or build artifacts are bloated, auto-clean WITHOUT asking: remove target/debug/incremental, run `cargo clean -p <unneeded crates>`, prune old target/debug artifacts, and report what was freed. Never delete source, git history, or user data. This is a standing user preference ('you should always do it... add a simple check at end and auto do so').",
+    "path": "policy",
+    "scope": "project",
+    "reference": {},
+    "arguments": {},
+    "metadata": {},
+    "source": "agent",
+    "created_at": "2026-08-11T08:03:22.957360+00:00",
+    "updated_at": "2026-08-11T08:03:22.957370+00:00",
+    "version": 1
+   }
+  },
+  "memory": {
+   "convex_backend_feature_backlog_user_deferred_items": {
+    "id": "convex_backend_feature_backlog_user_deferred_items",
+    "kind": "memory",
+    "title": "convex-backend feature backlog (user-deferred items)",
+    "content": "In the convex-backend repo, the user deferred these features to LATER (do not start without being asked): 1) durable objects as a DATABASE-BACKED Convex feature in Cloudflare Durable Objects style (named objects, persisted state, alarms/timers); 2) SurrealDB newest 3.0 integration (alt transactional backend or data-source connector); 3) Turso/libsql support (similar to sqlite). ACTIVE focus (current): WASM backend-function guest implementations + examples for Rust, Go, C/C++, Dart, Kotlin in crates/wasm_runner (docs/wasm.md tracks status).",
+    "path": "general",
+    "scope": "project",
+    "reference": {},
+    "arguments": {},
+    "metadata": {},
+    "source": "agent",
+    "created_at": "2026-08-11T08:03:22.958117+00:00",
+    "updated_at": "2026-08-11T08:21:13.460880+00:00",
+    "version": 2
+   }
+  },
+  "skill": {},
+  "subagent": {}
+ },
+ "refinements": []
+}
