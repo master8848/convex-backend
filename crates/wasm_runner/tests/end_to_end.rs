@@ -2,7 +2,10 @@
 //! executing against a real Transaction through the wasm_runner host
 //! functions.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Context;
 use common::{
@@ -351,7 +354,9 @@ fn test_rust_guest_end_to_end() -> anyhow::Result<()> {
         );
 
         // Function descriptor analysis.
-        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let module = runner
+            .get_or_compile_module(&module_binary, &WasmLimits::default())
+            .await?;
         let tx = database.begin(Identity::Unknown(None)).await?;
         let functions = wasm_runner::analyze_functions(
             &runner,
@@ -454,7 +459,9 @@ fn test_go_guest_end_to_end() -> anyhow::Result<()> {
         assert_eq!(av.to_uncommitted_json(), bv.to_uncommitted_json());
 
         // descriptor analysis
-        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let module = runner
+            .get_or_compile_module(&module_binary, &WasmLimits::default())
+            .await?;
         let tx = database.begin(Identity::Unknown(None)).await?;
         let functions = wasm_runner::analyze_functions(
             &runner,
@@ -560,7 +567,9 @@ fn test_c_guest_end_to_end() -> anyhow::Result<()> {
         assert!(result.result.is_err());
 
         // descriptor analysis
-        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let module = runner
+            .get_or_compile_module(&module_binary, &WasmLimits::default())
+            .await?;
         let tx = database.begin(Identity::Unknown(None)).await?;
         let functions = wasm_runner::analyze_functions(
             &runner,
@@ -668,7 +677,9 @@ fn test_cpp_guest_end_to_end() -> anyhow::Result<()> {
         assert!(result.result.is_err());
 
         // descriptor analysis
-        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let module = runner
+            .get_or_compile_module(&module_binary, &WasmLimits::default())
+            .await?;
         let tx = database.begin(Identity::Unknown(None)).await?;
         let functions = wasm_runner::analyze_functions(
             &runner,
@@ -695,7 +706,175 @@ fn test_module_validation_rejects_bad_modules() -> anyhow::Result<()> {
         // Not a wasm module at all.
         assert!(runner
             .get_or_compile_module(b"not wasm", &WasmLimits::default())
+            .await
             .is_err());
+
+        let mk_module = |imports: &str| {
+            format!(
+                r#"
+(module
+  {imports}
+  (memory (export "memory") 1)
+  (func (export "__convex_run") (result i32)
+    i32.const 0)
+  (func (export "__convex_functions") (result i32)
+    i32.const 0))
+"#,
+            )
+        };
+        // Imports outside the WASI preview 1 surface are rejected.
+        let bad_wasi = mk_module(
+            r#"(import "wasi_snapshot_preview1" "not_a_wasi_function" (func $x (result i32)))"#,
+        );
+        let err = runner
+            .get_or_compile_module(bad_wasi.as_bytes(), &WasmLimits::default())
+            .await
+            .expect_err("unknown WASI import should be rejected");
+        assert!(
+            format!("{err:#}").contains("outside the WASI preview 1 surface"),
+            "{err:#}"
+        );
+        // Imports outside the host function surface are rejected.
+        let bad_env = mk_module(r#"(import "env" "not_a_host_function" (func $x (result i32)))"#);
+        let err = runner
+            .get_or_compile_module(bad_env.as_bytes(), &WasmLimits::default())
+            .await
+            .expect_err("unknown env import should be rejected");
+        assert!(
+            format!("{err:#}").contains("outside the allowed host function surface"),
+            "{err:#}"
+        );
+        // Imports from a foreign module are rejected.
+        let bad_module = mk_module(r#"(import "some_other_module" "foo" (func $x (result i32)))"#);
+        let err = runner
+            .get_or_compile_module(bad_module.as_bytes(), &WasmLimits::default())
+            .await
+            .expect_err("foreign module import should be rejected");
+        assert!(
+            format!("{err:#}").contains("outside the allowed sandbox surface"),
+            "{err:#}"
+        );
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn test_huge_guest_buffers_are_rejected() -> anyhow::Result<()> {
+    // A guest can pass arbitrary (ptr, len) pairs to host functions. The host
+    // must reject out-of-bounds ranges before allocating anything.
+    let tokio = ProdRuntime::init_tokio()?;
+    tokio.block_on(async {
+        let runner = WasmRunner::new()?;
+        let rt = ProdRuntime::new(&tokio);
+        let (persistence, mut database) = new_database(&rt).await?;
+        database = create_table(&database, &persistence, &rt, "counters").await?;
+
+        let huge_output_set = r#"
+(module
+  (import "env" "__convex_output_set" (func $output_set (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "__convex_run") (result i32)
+    i32.const 0
+    i32.const 2147483647
+    call $output_set
+    i32.const 0)
+  (func (export "__convex_functions") (result i32)
+    i32.const 0))
+"#;
+        let (_, result) = run_function(
+            &runner,
+            huge_output_set.as_bytes(),
+            &database,
+            "echo",
+            serde_json::json!([]),
+        )
+        .await?;
+        let message = result
+            .result
+            .expect_err("huge output_set length should fail")
+            .message;
+        assert!(message.contains("out of bounds"), "{message}");
+
+        let huge_random_bytes = r#"
+(module
+  (import "env" "__convex_random_bytes" (func $random_bytes (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "__convex_run") (result i32)
+    i32.const 0
+    i32.const 2147483647
+    call $random_bytes
+    i32.const 0)
+  (func (export "__convex_functions") (result i32)
+    i32.const 0))
+"#;
+        let (_, result) = run_function(
+            &runner,
+            huge_random_bytes.as_bytes(),
+            &database,
+            "echo",
+            serde_json::json!([]),
+        )
+        .await?;
+        let message = result
+            .result
+            .expect_err("huge random_bytes length should fail")
+            .message;
+        assert!(message.contains("out of bounds"), "{message}");
+
+        anyhow::Ok(())
+    })
+}
+
+#[test]
+fn test_instantiation_timeout() -> anyhow::Result<()> {
+    // A module whose `start` function runs forever (burning the entire fuel
+    // budget with no wall-clock bound before the fix) must be cut off by the
+    // invocation timeout.
+    let tokio = ProdRuntime::init_tokio()?;
+    tokio.block_on(async {
+        let runner = WasmRunner::new()?;
+        let rt = ProdRuntime::new(&tokio);
+        let (_persistence, database) = new_database(&rt).await?;
+
+        let spinning_start = r#"
+(module
+  (memory (export "memory") 1)
+  (start $start)
+  (func $start
+    (loop $spin
+      br $spin))
+  (func (export "__convex_run") (result i32)
+    i32.const 0)
+  (func (export "__convex_functions") (result i32)
+    i32.const 0))
+"#;
+        let identity = Identity::Unknown(None);
+        let tx = database.begin(identity).await?;
+        let result = run_wasm_udf(
+            &runner,
+            spinning_start.as_bytes(),
+            WasmInput {
+                function_name: "echo".to_string(),
+                args_json: "[]".to_string(),
+            },
+            tx,
+            ComponentId::Root,
+            [7u8; 32],
+            UnixTimestamp::from_millis(1_700_000_000_000),
+            WasmLimits {
+                timeout: Duration::from_millis(500),
+                ..WasmLimits::default()
+            },
+            true,
+            None,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => anyhow::bail!("blocking start function should time out"),
+            Err(e) => e,
+        };
+        let message = format!("{err:#}");
+        assert!(message.contains("Timed out instantiating"), "{message}");
         anyhow::Ok(())
     })
 }

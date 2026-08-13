@@ -69,12 +69,19 @@ use crate::{
         VirtualMonotonicClock,
         VirtualWallClock,
     },
-    limits::WasmLimits,
+    limits::{
+        WasmLimits,
+        DEFAULT_MAX_MEMORY_BYTES,
+    },
     validation::validate_module,
 };
 
 /// The maximum number of compiled modules kept in memory.
 const MAX_CACHED_MODULES: usize = 128;
+/// The maximum number of modules compiled concurrently. Compilation is
+/// CPU-intensive, so concurrent compiles are limited to a small pool to avoid
+/// starving the runtime under a flood of unique modules.
+const MAX_CONCURRENT_COMPILES: usize = 2;
 /// The reactor initialization export used by Go guests.
 const INITIALIZE: &str = "_initialize";
 /// The maximum number of log lines captured per invocation, matching the
@@ -88,6 +95,7 @@ const MAX_LOG_LINES: usize = 256;
 pub struct WasmRunner {
     engine: Engine,
     module_cache: Mutex<HashMap<[u8; 32], Arc<Module>>>,
+    compile_semaphore: tokio::sync::Semaphore,
 }
 
 impl WasmRunner {
@@ -102,11 +110,17 @@ impl WasmRunner {
             // Disable relaxed SIMD, whose behavior is nondeterministic.
             .wasm_relaxed_simd(false)
             // CPU budget via fuel, with cooperative async yields.
-            .consume_fuel(true);
+            .consume_fuel(true)
+            // WasmGC allocations (struct.new, array.new, ...) live in a GC
+            // heap that StoreLimits::memory_size does not bound, so cap the
+            // GC heap reservation at the linear memory budget.
+            .gc_heap_reservation(DEFAULT_MAX_MEMORY_BYTES)
+            .gc_heap_reservation_for_growth(DEFAULT_MAX_MEMORY_BYTES);
         let engine = Engine::new(&config)?;
         Ok(Self {
             engine,
             module_cache: Mutex::new(HashMap::new()),
+            compile_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_COMPILES),
         })
     }
 
@@ -116,7 +130,11 @@ impl WasmRunner {
     }
 
     /// Compile (or return from cache) a validated module for the given binary.
-    pub fn get_or_compile_module(
+    ///
+    /// Compilation runs on a blocking thread with a wall-clock timeout and a
+    /// bound on the number of concurrent compiles, so a flood of unique
+    /// modules cannot stall the async runtime or burn unbounded CPU.
+    pub async fn get_or_compile_module(
         &self,
         module_binary: &[u8],
         limits: &WasmLimits,
@@ -136,7 +154,30 @@ impl WasmRunner {
         {
             return Ok(module.clone());
         }
-        let module = Arc::new(Module::new(&self.engine, module_binary).map_err(|e| {
+        let _permit = self
+            .compile_semaphore
+            .acquire()
+            .await
+            .context("WASM compilation semaphore closed")?;
+        // Another task may have compiled the same module while we waited for
+        // the permit.
+        if let Some(module) = self
+            .module_cache
+            .lock()
+            .expect("cache poisoned")
+            .get(&sha256)
+        {
+            return Ok(module.clone());
+        }
+        let engine = self.engine.clone();
+        let module_binary = module_binary.to_vec();
+        let compiled = tokio::time::timeout(
+            limits.compile_timeout,
+            tokio::task::spawn_blocking(move || Module::new(&engine, &module_binary)),
+        )
+        .await
+        .context("Timed out compiling WASM module")??;
+        let module = Arc::new(compiled.map_err(|e| {
             anyhow::anyhow!(
                 "Failed to compile WASM module (was it built with the convex_sdk?): {e}"
             )
@@ -187,11 +228,17 @@ impl HostContext {
         }
         let ptr = usize::try_from(ptr).map_err(|_| wasmtime::Error::msg("negative pointer"))?;
         let memory = Self::memory(caller)?;
-        let mut buffer = vec![0u8; len];
-        memory
-            .read(caller, ptr, &mut buffer)
-            .map_err(|_| wasmtime::Error::msg("guest memory read out of bounds"))?;
-        Ok(buffer)
+        // Bound-check against the actual memory size before allocating, so a
+        // guest cannot request a huge allocation that fails only after the
+        // host has already committed the buffer.
+        let data = memory.data(caller);
+        let end = ptr
+            .checked_add(len)
+            .ok_or_else(|| wasmtime::Error::msg("guest memory read out of bounds"))?;
+        if end > data.len() {
+            return Err(wasmtime::Error::msg("guest memory read out of bounds"));
+        }
+        Ok(data[ptr..end].to_vec())
     }
 
     fn write_guest(
@@ -354,6 +401,14 @@ fn register_sync_host_functions(linker: &mut Linker<HostContext>) -> Result<(), 
         RANDOM_BYTES,
         |mut caller: Caller<'_, HostContext>, dest: i32, len: i32| -> Result<(), wasmtime::Error> {
             let len = usize::try_from(len).map_err(|_| wasmtime::Error::msg("negative length"))?;
+            let ptr =
+                usize::try_from(dest).map_err(|_| wasmtime::Error::msg("negative pointer"))?;
+            // Bound-check before allocating so a guest cannot force a huge
+            // allocation that is rejected only after the host commits it.
+            let data_size = HostContext::memory(&mut caller)?.data_size(&caller);
+            if len > 0 && ptr.checked_add(len).is_none_or(|end| end > data_size) {
+                return Err(wasmtime::Error::msg("guest memory write out of bounds"));
+            }
             let mut bytes = vec![0u8; len];
             caller.data_mut().rng.fill_bytes(&mut bytes);
             caller.data_mut().observed_rng = true;
@@ -495,10 +550,11 @@ pub(crate) async fn execute_module<RT: Runtime>(
     register_sync_host_functions(&mut linker)?;
     register_db_host_functions(&mut linker, &shared)?;
 
-    let instance = linker
-        .instantiate_async(&mut store, module)
-        .await
-        .map_err(|e| anyhow::anyhow!("Instantiating WASM module: {e}"))?;
+    let instance =
+        tokio::time::timeout(limits.timeout, linker.instantiate_async(&mut store, module))
+            .await
+            .context("Timed out instantiating WASM module")?
+            .map_err(|e| anyhow::anyhow!("Instantiating WASM module: {e}"))?;
     // Go guests (and other reactor-style runtimes) require `_initialize` to
     // be called once before any export.
     if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, INITIALIZE) {
@@ -528,7 +584,10 @@ pub(crate) async fn execute_module<RT: Runtime>(
                 }
             },
             Ok(Err(trap)) => {
-                let message = trap.to_string();
+                // Use the alternate Display form: this wasmtime's default
+                // Display only shows the outermost backtrace context and drops
+                // the underlying trap/host-function message.
+                let message = format!("{trap:#}");
                 if message.contains("all fuel consumed") {
                     Err(JsError::from_message(
                         "WASM function exceeded its instruction budget".to_string(),
@@ -643,7 +702,10 @@ pub async fn analyze_functions<RT: Runtime>(
         max_call_data: limits.max_call_data,
     });
     register_db_host_functions(&mut linker, &shared)?;
-    let instance = linker.instantiate_async(&mut store, module).await?;
+    let instance =
+        tokio::time::timeout(limits.timeout, linker.instantiate_async(&mut store, module))
+            .await
+            .context("Timed out instantiating WASM module")??;
     if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, INITIALIZE) {
         tokio::time::timeout(limits.timeout, initialize.call_async(&mut store, ()))
             .await

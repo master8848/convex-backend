@@ -59,7 +59,7 @@ pub async fn dev_site_proxy(
         .route("/", proxy_handler)
         .with_state(site_forward_prefix);
 
-    let service = ConvexHttpService::new(
+    let mut service = ConvexHttpService::new(
         Router::new().fallback_service(router),
         "backend_http_proxy",
         "unknown".to_string(),
@@ -67,6 +67,9 @@ pub async fn dev_site_proxy(
         *HTTP_SERVER_TIMEOUT_DURATION,
         NoopRouteMapper,
     );
+    // The proxy is a pass-through to the backend, which serves its own
+    // authenticated /metrics route.
+    service.set_meta_routes_enabled(false);
     let proxy_server = service.serve(addr, async move {
         let _ = shutdown_rx.recv().await;
         tracing::info!("Shut down proxy");

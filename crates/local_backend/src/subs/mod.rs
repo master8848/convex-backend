@@ -426,9 +426,29 @@ pub async fn sync_handler(
     host: ResolvedHostname,
     request_metadata: RequestMetadata,
     client_version: ClientVersion,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
     on_connect: Box<dyn FnOnce(SessionId) + Send>,
 ) -> Result<impl IntoResponse, HttpResponseError> {
+    // Reject WebSocket upgrades from browser origins that aren't allowlisted.
+    // Requests without an Origin header (e.g. the CLI) are always allowed.
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        let origin = origin.to_str().context(ErrorMetadata::bad_request(
+            "InvalidOrigin",
+            "Invalid Origin header",
+        ))?;
+        if !st.allowed_origins.iter().any(|allowed| allowed == origin) {
+            return Err(anyhow::anyhow!(ErrorMetadata::forbidden(
+                "OriginNotAllowed",
+                format!(
+                    "WebSocket connection rejected: origin {origin} is not in the allowed origins \
+                     list. Configure --allowed-origins to allow it."
+                ),
+            ))
+            .into());
+        }
+    }
+
     let config = new_sync_worker_config(
         client_version,
         st.subscription_reconnect_rate_limiter.clone(),
@@ -461,6 +481,7 @@ pub async fn sync(
     ExtractResolvedHostname(host): ExtractResolvedHostname,
     ExtractRequestMetadata(request_metadata): ExtractRequestMetadata,
     ExtractClientVersion(client_version): ExtractClientVersion,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, HttpResponseError> {
     sync_handler(
@@ -468,6 +489,7 @@ pub async fn sync(
         host,
         request_metadata,
         client_version,
+        headers,
         ws,
         Box::new(|_session_id| ()),
     )

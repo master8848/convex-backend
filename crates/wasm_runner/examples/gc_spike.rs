@@ -2,7 +2,12 @@
 //! default) can compile and run WasmGC modules (struct/array/i31/ref), using
 //! the exact Config wasm_runner uses (nan canonicalization, relaxed-simd off,
 //! fuel on). Run: cargo run -p wasm_runner --example gc_spike
-use wasmtime::{Config, Engine, Module, Store};
+use wasmtime::{
+    Config,
+    Engine,
+    Module,
+    Store,
+};
 
 const GC_WAT: &str = r#"
 (module
@@ -89,14 +94,19 @@ fn main() -> anyhow::Result<()> {
     config
         .cranelift_nan_canonicalization(true)
         .wasm_relaxed_simd(false)
-        .consume_fuel(true);
+        .consume_fuel(true)
+        .gc_heap_reservation(256 * 1024 * 1024)
+        .gc_heap_reservation_for_growth(256 * 1024 * 1024);
     let engine = Engine::new(&config)?;
 
     // Module::new accepts .wat text directly; GC is enabled by default
     // (Config::wasm_gc is `true` by default, and the `gc`/`gc-*` Cargo
     // features are in wasmtime 47.0.3's default feature set).
     let module = Module::new(&engine, GC_WAT)?;
-    println!("compiled GC module OK (imports: {:?})", module.imports().count());
+    println!(
+        "compiled GC module OK (imports: {:?})",
+        module.imports().count()
+    );
 
     let mut store = Store::new(&engine, ());
     store.set_fuel(1_000_000)?;
@@ -108,7 +118,8 @@ fn main() -> anyhow::Result<()> {
     println!("sum() -> {got} (expected 72)");
 
     let rt = instance.get_typed_func::<i32, i32>(&mut store, "i31_roundtrip")?;
-    for v in [-7, 0, 42, 1_000_000_000] { // i31 holds 31 bits (max ~2^30-1)
+    for v in [-7, 0, 42, 1_000_000_000] {
+        // i31 holds 31 bits (max ~2^30-1)
         let g = rt.call(&mut store, v)?;
         assert_eq!(g, v);
         println!("i31_roundtrip({v}) -> {g}");

@@ -63,6 +63,12 @@ impl TryFrom<String> for ObjectKey {
 
     fn try_from(s: String) -> anyhow::Result<Self> {
         anyhow::ensure!(OBJECT_KEY_REGEX.is_match(&s));
+        // Disallow path traversal: no component may be empty, ".", or contain
+        // "..", otherwise joining a key onto a local storage directory could
+        // escape it (e.g. via a leading "/" or "../").
+        anyhow::ensure!(s.split('/').all(|component| {
+            !component.is_empty() && component != "." && !component.contains("..")
+        }));
         Ok(Self(s))
     }
 }
@@ -86,5 +92,42 @@ impl Deref for ObjectKey {
 
     fn deref(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_key_rejects_path_traversal() {
+        for s in [
+            "..",
+            "../foo",
+            "foo/../bar",
+            "foo/..",
+            "foo/..bar",
+            "foo/bar..",
+            "/etc/passwd",
+            "//etc/passwd",
+            "foo//bar",
+            "foo/",
+            "/foo",
+        ] {
+            assert!(
+                ObjectKey::try_from(s.to_string()).is_err(),
+                "expected {s} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn object_key_accepts_valid_keys() {
+        for s in ["abc", "a-b_c.d", "foo/bar", "0f9a5d6e-a9b0-4d2f", "0"] {
+            assert!(
+                ObjectKey::try_from(s.to_string()).is_ok(),
+                "expected {s} to be accepted"
+            );
+        }
     }
 }

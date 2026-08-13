@@ -26,6 +26,7 @@ fastrace = { workspace = true }
 futures = { workspace = true }
 futures-async-stream = { workspace = true }
 http-body-util = { workspace = true }
+keybroker = { workspace = true }
 pb = { workspace = true }
 runtime = { workspace = true, optional = true }
 serde_json = { workspace = true }

@@ -128,7 +128,6 @@ async fn run_function(
     .await
 }
 
-
 /// Builds the Zig guest fixture and returns the compiled wasm bytes.
 /// Requires `zig` (0.16+). Returns None if the toolchain is unavailable.
 fn build_zig_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
@@ -172,7 +171,9 @@ fn build_zig_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
     );
     let wasm = std::path::Path::new(dir).join("guest.wasm");
     anyhow::ensure!(wasm.exists(), "zig guest module binary not found");
-    std::fs::read(wasm).context("Zig guest module binary not found").map(Some)
+    std::fs::read(wasm)
+        .context("Zig guest module binary not found")
+        .map(Some)
 }
 
 #[test]
@@ -198,10 +199,7 @@ fn test_zig_guest_end_to_end() -> anyhow::Result<()> {
         )
         .await?;
         let value: PendingValue = result.result?.unpack()?;
-        assert_eq!(
-            value.to_uncommitted_json(),
-            serde_json::json!("hello zig"),
-        );
+        assert_eq!(value.to_uncommitted_json(), serde_json::json!("hello zig"),);
 
         // unknown function -> guest error, not a host panic.
         let (_, result) = run_function(
@@ -215,7 +213,9 @@ fn test_zig_guest_end_to_end() -> anyhow::Result<()> {
         assert!(result.result.is_err());
 
         // descriptor analysis
-        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let module = runner
+            .get_or_compile_module(&module_binary, &WasmLimits::default())
+            .await?;
         let tx = database.begin(Identity::Unknown(None)).await?;
         let functions = wasm_runner::analyze_functions(
             &runner,

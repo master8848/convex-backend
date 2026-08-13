@@ -102,7 +102,7 @@ pub async fn run_wasm_udf<RT: Runtime>(
     allow_unresolved_commit_ts: bool,
     log_line_sender: Option<mpsc::UnboundedSender<LogLine>>,
 ) -> anyhow::Result<(Transaction<RT>, WasmUdfResult)> {
-    let module = runner.get_or_compile_module(module_binary, &limits)?;
+    let module = runner.get_or_compile_module(module_binary, &limits).await?;
     let input_json = format!(
         r#"{{"{}": {}, "{}": {}}}"#,
         INPUT_FUNCTION_KEY,

@@ -119,7 +119,16 @@ fn run_subcommand(command: &Subcommand) -> Result<(), MainError> {
 fn generate_admin_key(args: &AdminKeyArgs) -> Result<(), MainError> {
     let secret = DeploymentSecret::try_from(args.instance_secret.as_str())?;
     let broker = KeyBroker::new(&args.instance_name, secret)?;
-    let admin_key = broker.issue_admin_key(MemberId(0));
+    let admin_key = match args.expires_in {
+        Some(expires_in) => {
+            let expires_s = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                .as_secs()
+                + expires_in;
+            broker.issue_admin_key_with_expiry(MemberId(0), expires_s)
+        },
+        None => broker.issue_admin_key(MemberId(0)),
+    };
     println!("{}", admin_key.as_str());
     Ok(())
 }
@@ -167,7 +176,7 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
     .await?;
     let router = router(st.clone());
     let mut shutdown_rx_ = shutdown_rx.clone();
-    let http_service = ConvexHttpService::new(
+    let mut http_service = ConvexHttpService::new(
         router,
         "backend",
         SERVER_VERSION_STR.to_string(),
@@ -175,6 +184,9 @@ async fn run_server_inner(runtime: ProdRuntime, config: LocalConfig) -> anyhow::
         *HTTP_SERVER_TIMEOUT_DURATION,
         HttpActionRouteMapper,
     );
+    // The local backend serves its own /metrics and /version routes, so that
+    // /metrics can require admin-key authentication.
+    http_service.set_meta_routes_enabled(false);
     let serve_http_future = http_service.serve(config.http_bind_address(), async move {
         let _ = shutdown_rx_.recv().await;
     });

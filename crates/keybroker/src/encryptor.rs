@@ -33,6 +33,7 @@ pub type DeterministicPurpose = Purpose<true>;
 impl Purpose {
     pub const ACTION_CALLBACK_TOKEN: Purpose = Purpose("action callback token");
     pub const ADMIN_KEY: Purpose = Purpose("admin key");
+    pub const CLIENT_DRIVEN_UPLOAD: Purpose = Purpose("client driven upload");
     /// Cursors are issued in UDFs and are also fed back as arguments. As such
     /// we want them to be deterministic to avoid breaking caching.
     /// These do not need to be secret in the first place - only tamper-proof.

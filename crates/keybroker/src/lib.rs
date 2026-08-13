@@ -23,6 +23,7 @@ pub use self::{
         StoreFileAuthorization,
         SystemKey,
         UserIdentity,
+        LEGACY_LOCAL_DEV_SECRET,
     },
     encryptor::{
         Encryptor,

@@ -210,6 +210,7 @@ use keybroker::{
     DeploymentOp,
     Identity,
     KeyBroker,
+    RandomEncryptor,
 };
 use log_streaming::add_local_log_sink_on_startup;
 use maplit::{
@@ -629,13 +630,19 @@ pub async fn create_storage<RT: Runtime>(
     runtime: RT,
     storage_type: &model::database_globals::types::StorageType,
     use_case: StorageUseCase,
+    client_driven_upload_encryptor: &RandomEncryptor,
 ) -> anyhow::Result<Arc<dyn Storage>> {
     let storage: Arc<dyn Storage> = match storage_type {
         model::database_globals::types::StorageType::S3 { s3_prefix } => {
             Arc::new(S3Storage::for_use_case(use_case, s3_prefix.clone(), runtime).await?)
         },
         model::database_globals::types::StorageType::Local { dir } => {
-            let storage = LocalDirStorage::for_use_case(runtime, dir, use_case)?;
+            let storage = LocalDirStorage::for_use_case(
+                runtime,
+                dir,
+                use_case,
+                client_driven_upload_encryptor.clone(),
+            )?;
             tracing::info!("{use_case} storage path: {:?}", storage.path());
             Arc::new(storage)
         },
@@ -652,6 +659,7 @@ impl<RT: Runtime> Application<RT> {
         database: &Database<RT>,
         storage_tag_initializer: StorageTagInitializer,
         deployment_name: String,
+        client_driven_upload_encryptor: &RandomEncryptor,
     ) -> anyhow::Result<ApplicationStorage> {
         let storage_type = {
             let mut tx = database.begin_system().await?;
@@ -664,22 +672,39 @@ impl<RT: Runtime> Application<RT> {
             storage_type
         };
 
-        let files_storage =
-            create_storage(runtime.clone(), &storage_type, StorageUseCase::Files).await?;
-        let modules_storage =
-            create_storage(runtime.clone(), &storage_type, StorageUseCase::Modules).await?;
+        let files_storage = create_storage(
+            runtime.clone(),
+            &storage_type,
+            StorageUseCase::Files,
+            client_driven_upload_encryptor,
+        )
+        .await?;
+        let modules_storage = create_storage(
+            runtime.clone(),
+            &storage_type,
+            StorageUseCase::Modules,
+            client_driven_upload_encryptor,
+        )
+        .await?;
         let search_storage = create_storage(
             runtime.clone(),
             &storage_type,
             StorageUseCase::SearchIndexes,
+            client_driven_upload_encryptor,
         )
         .await?;
-        let exports_storage =
-            create_storage(runtime.clone(), &storage_type, StorageUseCase::Exports).await?;
+        let exports_storage = create_storage(
+            runtime.clone(),
+            &storage_type,
+            StorageUseCase::Exports,
+            client_driven_upload_encryptor,
+        )
+        .await?;
         let snapshot_imports_storage = create_storage(
             runtime.clone(),
             &storage_type,
             StorageUseCase::SnapshotImports,
+            client_driven_upload_encryptor,
         )
         .await?;
 

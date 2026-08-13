@@ -17,6 +17,7 @@ use keybroker::{
     DeploymentSecret,
     KeyBroker,
     DEV_INSTANCE_NAME,
+    LEGACY_LOCAL_DEV_SECRET,
 };
 use metrics::SERVER_VERSION_STR;
 use model::database_globals::types::StorageTagInitializer;
@@ -35,12 +36,22 @@ pub struct LocalConfig {
     pub db: DbDriverTag,
 
     /// Host interface to bind to
-    #[clap(short, long, default_value = "0.0.0.0")]
+    #[clap(short, long, default_value = "127.0.0.1")]
     pub interface: ::std::net::Ipv4Addr,
 
     /// Host port daemon should bind to
     #[clap(short, long, default_value = "3210")]
     pub port: u16,
+
+    /// Origins allowed to make browser requests (CORS and WebSocket
+    /// upgrades). Requests without an Origin header (e.g. the CLI) are
+    /// always allowed. Defaults to the self-hosted dashboard origins.
+    #[clap(
+        long,
+        value_delimiter = ',',
+        default_value = "http://127.0.0.1:6790,http://localhost:6790,http://127.0.0.1:6791,http://localhost:6791"
+    )]
+    pub allowed_origins: Vec<String>,
 
     /// Host port to bind for Convex HTTP Actions
     #[clap(long, default_value = "3211")]
@@ -75,6 +86,20 @@ pub struct LocalConfig {
     ///
     /// i.e. if doing `await fetch(request)` within an action, you can
     /// send the request through this proxy to screen it for SSRF attacks.
+    ///
+    /// When a proxy is configured, all UDF `fetch` requests are sent through
+    /// it and SSRF screening is delegated to the proxy (e.g. Smokescreen),
+    /// which answers with HTTP 407 for blocked targets.
+    ///
+    /// When no proxy is configured, the backend screens UDF `fetch` requests
+    /// itself: an SSRF denylist of private, loopback, link-local, and cloud
+    /// metadata IP ranges is enforced by default, with DNS-rebind-safe
+    /// resolution (the hostname is resolved once, every address is validated,
+    /// and only validated addresses are connected to). To allow UDF `fetch`
+    /// requests to private IPs without a proxy (e.g. to reach internal
+    /// services on your own network), set the environment variable
+    /// CONVEX_ALLOW_PRIVATE_FETCH_IPS=1 (insecure unless you run a separate
+    /// screening proxy).
     #[clap(long)]
     pub convex_http_proxy: Option<Url>,
 
@@ -126,7 +151,7 @@ pub struct LocalConfig {
     ///
     /// On development deployments, it can be helpful to have this information
     /// reach the client for debugging purposes.
-    #[clap(long, default_value = "false")]
+    #[clap(long, default_value = "true")]
     pub redact_logs_to_client: bool,
 
     /// Path of local file for logs to be routed to. For local testing
@@ -171,6 +196,11 @@ pub struct AdminKeyArgs {
     /// Instance secret for this backend.
     #[clap(long)]
     pub instance_secret: String,
+
+    /// Number of seconds after which the issued admin key expires.
+    /// If unset, the key never expires.
+    #[clap(long)]
+    pub expires_in: Option<u64>,
 }
 
 impl fmt::Debug for LocalConfig {
@@ -245,7 +275,24 @@ impl LocalConfig {
                 "--instance-secret is required. Generate one with `openssl rand -hex 32`",
             )
         })?;
-        DeploymentSecret::try_from(secret)
+        let deployment_secret = DeploymentSecret::try_from(secret)?;
+        // The legacy local dev secret is a committed, well-known constant, so
+        // anyone who can reach this backend could mint admin keys offline.
+        // Only allow it on loopback interfaces unless explicitly overridden.
+        if secret == LEGACY_LOCAL_DEV_SECRET
+            && !self.interface.is_loopback()
+            && std::env::var("CONVEX_ALLOW_INSECURE_DEV_SECRET").is_err()
+        {
+            anyhow::bail!(
+                "Refusing to serve with the well-known local dev instance secret on the \
+                 non-loopback interface {}. Anyone who can reach this port can mint admin keys \
+                 offline. Generate a random secret with `openssl rand -hex 32` instead, or set \
+                 CONVEX_ALLOW_INSECURE_DEV_SECRET=1 to override (insecure, for local testing \
+                 only).",
+                self.interface,
+            );
+        }
+        Ok(deployment_secret)
     }
 
     pub fn storage_tag_initializer(&self) -> StorageTagInitializer {

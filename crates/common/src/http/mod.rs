@@ -1308,7 +1308,7 @@ impl<T: fmt::Display> fmt::Display for LogOptFmt<T> {
 
 /// CLI endpoints can be used from browser IDEs (e.g. StackBlitz), which send
 /// different headers.
-pub fn cli_cors() -> CorsLayer {
+pub fn cli_cors(allowed_origins: &[String]) -> CorsLayer {
     CorsLayer::new()
         .allow_headers(AllowHeaders::mirror_request())
         .allow_credentials(true)
@@ -1319,7 +1319,12 @@ pub fn cli_cors() -> CorsLayer {
             Method::OPTIONS,
             Method::DELETE,
         ])
-        .allow_origin(AllowOrigin::mirror_request())
+        .allow_origin(AllowOrigin::list(
+            allowed_origins
+                .iter()
+                .filter_map(|origin| HeaderValue::from_str(origin).ok())
+                .collect::<Vec<_>>(),
+        ))
         .max_age(Duration::from_secs(86400))
 }
 

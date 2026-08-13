@@ -1940,6 +1940,12 @@ pub static ENV_VAR_TOTAL_SIZE_LIMIT: LazyLock<usize> =
 pub static DISABLE_METRICS_ENDPOINT: LazyLock<bool> =
     LazyLock::new(|| env_config("DISABLE_METRICS_ENDPOINT", false));
 
+/// If set, serve /metrics without admin-key authentication. Defaults to
+/// requiring an admin key, so that metrics can't leak to unauthenticated
+/// clients.
+pub static ALLOW_UNAUTHENTICATED_METRICS: LazyLock<bool> =
+    LazyLock::new(|| env_config("CONVEX_ALLOW_UNAUTHENTICATED_METRICS", false));
+
 /// When using the S3 storage provider with expiring AWS credentials, the
 /// duration before credential expiration that the AWS client should refresh
 /// those credentials.

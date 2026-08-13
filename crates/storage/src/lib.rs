@@ -70,10 +70,7 @@ use futures::{
     TryStreamExt,
 };
 use futures_async_stream::try_stream;
-use serde_json::{
-    json,
-    Value as JsonValue,
-};
+use keybroker::RandomEncryptor;
 use tempfile::TempDir;
 use tokio::{
     io::AsyncWrite,
@@ -94,6 +91,8 @@ pub const LOCAL_DIR_MIN_PART_SIZE: usize = 5 * (1 << 20);
 pub const LOCAL_DIR_MAX_PART_SIZE: usize = 8 * (1 << 30);
 pub const MAX_NUM_PARTS: usize = 10000;
 pub const MAXIMUM_PARALLEL_UPLOADS: usize = 8;
+pub const CLIENT_DRIVEN_UPLOAD_MAX_PART_SIZE: usize = 5 * (1 << 30);
+const CLIENT_DRIVEN_UPLOAD_TOKEN_VERSION: u8 = 1;
 
 #[derive(Clone, Eq, PartialEq, PartialOrd, Ord, derive_more::Display)]
 pub struct UploadId(String);
@@ -815,6 +814,7 @@ pub struct LocalDirStorage<RT: Runtime> {
     rt: RT,
     dir: PathBuf,
     _temp_dir: Option<Arc<TempDir>>,
+    encryptor: RandomEncryptor,
 }
 
 impl<RT: Runtime> std::fmt::Debug for LocalDirStorage<RT> {
@@ -828,18 +828,19 @@ impl<RT: Runtime> std::fmt::Debug for LocalDirStorage<RT> {
 impl<RT: Runtime> LocalDirStorage<RT> {
     // Creates local storage using a temporary directory. The directory
     // is deleted when the object is dropped.
-    pub fn new(rt: RT) -> anyhow::Result<Self> {
+    pub fn new(rt: RT, encryptor: RandomEncryptor) -> anyhow::Result<Self> {
         let temp_dir = TempDir::new()?;
         let storage = Self {
             rt,
             dir: temp_dir.path().to_owned(),
             _temp_dir: Some(Arc::new(temp_dir)),
+            encryptor,
         };
         Ok(storage)
     }
 
     /// Create storage at the provided directory
-    pub fn new_at_path(rt: RT, dir: PathBuf) -> anyhow::Result<Self> {
+    pub fn new_at_path(rt: RT, dir: PathBuf, encryptor: RandomEncryptor) -> anyhow::Result<Self> {
         let dir = if dir.is_absolute() {
             dir
         } else {
@@ -850,6 +851,7 @@ impl<RT: Runtime> LocalDirStorage<RT> {
             rt,
             dir,
             _temp_dir: None,
+            encryptor,
         };
         Ok(storage)
     }
@@ -863,53 +865,68 @@ impl<RT: Runtime> LocalDirStorage<RT> {
         String::from(key) + ".blob"
     }
 
-    pub fn for_use_case(rt: RT, dir: &str, use_case: StorageUseCase) -> anyhow::Result<Self> {
+    pub fn for_use_case(
+        rt: RT,
+        dir: &str,
+        use_case: StorageUseCase,
+        encryptor: RandomEncryptor,
+    ) -> anyhow::Result<Self> {
         let use_case_str = use_case.to_string();
         anyhow::ensure!(!dir.is_empty());
-        let storage = LocalDirStorage::new_at_path(rt, PathBuf::from(dir).join(use_case_str))?;
+        let storage =
+            LocalDirStorage::new_at_path(rt, PathBuf::from(dir).join(use_case_str), encryptor)?;
         Ok(storage)
     }
+
+    /// Canonicalizes `path` and rejects it if it escapes the storage
+    /// directory.
+    fn validated_path(&self, path: &Path) -> anyhow::Result<PathBuf> {
+        let parent = path.parent().context("Path must have a parent")?;
+        let file_name = path.file_name().context("Path must have a file name")?;
+        let canonical_root = self.dir.canonicalize().with_context(|| {
+            format!(
+                "Couldn't canonicalize storage directory {}",
+                self.dir.display()
+            )
+        })?;
+        let canonical_parent = parent
+            .canonicalize()
+            .with_context(|| format!("Couldn't canonicalize path {}", parent.display()))?;
+        let canonical_path = canonical_parent.join(file_name);
+        anyhow::ensure!(
+            canonical_path.starts_with(&canonical_root),
+            "Path {} escapes the storage directory",
+            path.display()
+        );
+        Ok(canonical_path)
+    }
 }
 
-struct ClientDrivenUpload {
+fn client_driven_upload_to_token(
+    encryptor: &RandomEncryptor,
     object_key: ObjectKey,
     filepath: PathBuf,
+) -> ClientDrivenUploadToken {
+    let proto = pb::storage::ClientDrivenUpload {
+        object_key: object_key.to_string(),
+        filepath: filepath.to_string_lossy().into_owned(),
+    };
+    ClientDrivenUploadToken(encryptor.encrypt_proto(CLIENT_DRIVEN_UPLOAD_TOKEN_VERSION, &proto))
 }
 
-impl TryFrom<ClientDrivenUpload> for ClientDrivenUploadToken {
-    type Error = anyhow::Error;
-
-    fn try_from(value: ClientDrivenUpload) -> Result<Self, Self::Error> {
-        let v = json!({
-            "objectKey": value.object_key.to_string(),
-            "filepath": value.filepath.to_str(),
-        });
-        Ok(ClientDrivenUploadToken(serde_json::to_string(&v)?))
-    }
-}
-
-impl TryFrom<ClientDrivenUploadToken> for ClientDrivenUpload {
-    type Error = anyhow::Error;
-
-    fn try_from(value: ClientDrivenUploadToken) -> Result<Self, Self::Error> {
-        let v: JsonValue = serde_json::from_str(&value.0)?;
-        let object_key = v
-            .get("objectKey")
-            .context("missing objectKey")?
-            .as_str()
-            .context("objectKey should be str")?
-            .try_into()?;
-        let filepath = v
-            .get("filepath")
-            .context("missing filepath")?
-            .as_str()
-            .context("filepath should be str")?
-            .parse()?;
-        Ok(Self {
-            object_key,
-            filepath,
-        })
-    }
+fn client_driven_upload_from_token(
+    encryptor: &RandomEncryptor,
+    token: &ClientDrivenUploadToken,
+) -> anyhow::Result<(ObjectKey, PathBuf)> {
+    let proto = encryptor
+        .decrypt_proto::<pb::storage::ClientDrivenUpload>(
+            CLIENT_DRIVEN_UPLOAD_TOKEN_VERSION,
+            &token.0,
+        )
+        .context("Invalid client driven upload token")?;
+    let object_key = proto.object_key.try_into()?;
+    let filepath = PathBuf::from(proto.filepath);
+    Ok((object_key, filepath))
 }
 
 #[async_trait]
@@ -961,11 +978,11 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
             "LocalDirStorage file creation failed. Perhaps the storage object key isn't valid?",
         )?;
 
-        ClientDrivenUpload {
+        Ok(client_driven_upload_to_token(
+            &self.encryptor,
             object_key,
             filepath,
-        }
-        .try_into()
+        ))
     }
 
     async fn upload_part(
@@ -974,10 +991,13 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
         _part_number: u16,
         part: Bytes,
     ) -> anyhow::Result<ClientDrivenUploadPartToken> {
-        let ClientDrivenUpload {
-            object_key,
-            filepath,
-        } = token.try_into()?;
+        anyhow::ensure!(
+            part.len() <= CLIENT_DRIVEN_UPLOAD_MAX_PART_SIZE,
+            "Client driven upload part exceeds the {} byte limit",
+            CLIENT_DRIVEN_UPLOAD_MAX_PART_SIZE,
+        );
+        let (object_key, filepath) = client_driven_upload_from_token(&self.encryptor, &token)?;
+        let filepath = self.validated_path(&filepath)?;
         let file = OpenOptions::new().append(true).open(filepath)?;
         let mut upload = LocalDirUpload {
             object_key,
@@ -993,10 +1013,7 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
         token: ClientDrivenUploadToken,
         _part_tokens: Vec<ClientDrivenUploadPartToken>,
     ) -> anyhow::Result<ObjectKey> {
-        let ClientDrivenUpload {
-            object_key,
-            filepath: _,
-        } = token.try_into()?;
+        let (object_key, _filepath) = client_driven_upload_from_token(&self.encryptor, &token)?;
         Ok(object_key)
     }
 
@@ -1049,8 +1066,9 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
         key: &FullyQualifiedObjectKey,
         bytes_range: Range<u64>,
     ) -> BoxFuture<'static, anyhow::Result<StorageGetStream>> {
-        let path = Path::new(key.as_str()).to_owned();
+        let path = self.validated_path(Path::new(key.as_str()));
         async move {
+            let path = path?;
             let mut buf = vec![0; (bytes_range.end - bytes_range.start) as usize];
             let mut file = File::open(path.clone()).context(format!(
                 "Local dir storage couldn't open {}",
@@ -1070,7 +1088,9 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
         &self,
         key: &FullyQualifiedObjectKey,
     ) -> anyhow::Result<Option<ObjectAttributes>> {
-        let path = Path::new(key.as_str());
+        let Ok(path) = self.validated_path(Path::new(key.as_str())) else {
+            return Ok(None);
+        };
         let mut buf = vec![];
         let result = File::open(path);
         if result.is_err() {
@@ -1094,18 +1114,17 @@ impl<RT: Runtime> Storage for LocalDirStorage<RT> {
     }
 
     async fn delete_object(&self, key: &ObjectKey) -> anyhow::Result<()> {
-        let key = self.filename_for_key(key.clone());
-        let path = self.dir.join(key);
-        fs::remove_file(path)?;
+        let filepath = self.validated_path(&self.dir.join(self.filename_for_key(key.clone())))?;
+        fs::remove_file(filepath)?;
         Ok(())
     }
 
     async fn put_object(&self, key: ObjectKey, bytes: Bytes) -> anyhow::Result<()> {
-        let filename = self.filename_for_key(key);
-        let filepath = self.dir.join(filename);
-        fs::create_dir_all(filepath.parent().expect("Must have parent")).context(
+        let key_path = self.dir.join(self.filename_for_key(key));
+        fs::create_dir_all(key_path.parent().expect("Must have parent")).context(
             "LocalDirStorage file creation failed. Perhaps the storage object key isn't valid?",
         )?;
+        let filepath = self.validated_path(&key_path)?;
         let mut file = File::create(filepath)?;
         file.write_all(&bytes)?;
         Ok(())
@@ -1220,5 +1239,74 @@ impl Display for StorageUseCase {
             StorageUseCase::Files => write!(f, "files"),
             StorageUseCase::SearchIndexes => write!(f, "search"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use keybroker::{
+        DeploymentSecret,
+        KeyBroker,
+    };
+
+    use super::*;
+
+    fn test_encryptor() -> RandomEncryptor {
+        KeyBroker::new("test_instance", DeploymentSecret::random())
+            .unwrap()
+            .client_driven_upload_encryptor()
+            .clone()
+    }
+
+    #[test]
+    fn client_driven_upload_token_round_trips() {
+        let encryptor = test_encryptor();
+        let object_key: ObjectKey = "0f9a5d6e-a9b0-4d2f-8e1c-3b4a5c6d7e8f".try_into().unwrap();
+        let filepath = PathBuf::from("/tmp/storage/dir/0f9a5d6e-a9b0-4d2f-8e1c-3b4a5c6d7e8f.blob");
+        let token = client_driven_upload_to_token(&encryptor, object_key.clone(), filepath.clone());
+        let (decoded_key, decoded_filepath) =
+            client_driven_upload_from_token(&encryptor, &token).unwrap();
+        assert_eq!(decoded_key, object_key);
+        assert_eq!(decoded_filepath, filepath);
+    }
+
+    #[test]
+    fn client_driven_upload_token_doesnt_leak_plaintext() {
+        let encryptor = test_encryptor();
+        let token = client_driven_upload_to_token(
+            &encryptor,
+            "0f9a5d6e-a9b0-4d2f-8e1c-3b4a5c6d7e8f".try_into().unwrap(),
+            PathBuf::from("/tmp/secret/path.blob"),
+        );
+        assert!(!token.0.contains("/tmp/secret/path.blob"));
+        assert!(!token.0.contains("object_key"));
+        assert!(!token.0.contains("filepath"));
+    }
+
+    #[test]
+    fn client_driven_upload_token_rejects_tampering() {
+        let encryptor = test_encryptor();
+        let token = client_driven_upload_to_token(
+            &encryptor,
+            "0f9a5d6e-a9b0-4d2f-8e1c-3b4a5c6d7e8f".try_into().unwrap(),
+            PathBuf::from("/tmp/storage/dir/x.blob"),
+        );
+        let mut bytes = token.0.clone().into_bytes();
+        let mid = bytes.len() / 2;
+        bytes[mid] = if bytes[mid] == b'0' { b'1' } else { b'0' };
+        let tampered = ClientDrivenUploadToken(String::from_utf8(bytes).unwrap());
+        assert!(client_driven_upload_from_token(&encryptor, &tampered).is_err());
+    }
+
+    #[test]
+    fn client_driven_upload_token_rejects_wrong_key() {
+        let encryptor1 = test_encryptor();
+        let encryptor2 = test_encryptor();
+        let token = client_driven_upload_to_token(
+            &encryptor1,
+            "0f9a5d6e-a9b0-4d2f-8e1c-3b4a5c6d7e8f".try_into().unwrap(),
+            PathBuf::from("/tmp/storage/dir/x.blob"),
+        );
+        assert!(client_driven_upload_from_token(&encryptor2, &token).is_err());
     }
 }

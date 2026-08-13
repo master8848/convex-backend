@@ -13,6 +13,9 @@ message AdminKey {
     google.protobuf.Empty system = 4;
   }
   bool is_read_only = 5;
+  // Optional expiry, measured in seconds since the epoch. Keys without an
+  // expiry never expire.
+  optional uint64 expires_s = 6;
 }
 
 message StorageToken {

@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { version as npmVersion } from "../../version.js";
 import AdmZip from "adm-zip";
 import { Context } from "../../../bundler/context.js";
@@ -303,16 +304,19 @@ async function downloadZipFile(
     // Create a file in the tmp dir
     const zipLocation = tmpDir.registerTempPath(null);
     const readable = Readable.fromWeb(response.body! as any);
+    const hash = createHash("sha256");
     await tmpDir.writeFileStream(zipLocation, readable, (chunk: any) => {
       if (progressBar !== null) {
         progressBar.tick(chunk.length);
       }
+      hash.update(chunk);
     });
     if (progressBar) {
       progressBar.terminate();
       logFinishedStep(`Downloaded ${nameForLogging}`);
     }
     logVerbose("Downloaded zip file");
+    await verifyChecksum(ctx, url, hash.digest("hex"));
 
     const zip = new AdmZip(zipLocation);
     await withTmpDir(async (versionDir) => {
@@ -323,6 +327,45 @@ async function downloadZipFile(
     });
   });
   return executablePath(version);
+}
+
+/**
+ * Verifies the downloaded asset against the sha256 checksum published
+ * alongside the release. Skips verification (with a warning) when the release
+ * predates checksum publishing.
+ */
+async function verifyChecksum(
+  ctx: Context,
+  url: string,
+  actual: string,
+): Promise<void> {
+  const checksumUrl = `${url}.sha256`;
+  logVerbose(`Fetching checksum from ${checksumUrl}`);
+  let response: Response;
+  try {
+    response = await fetch(checksumUrl);
+  } catch (e) {
+    logWarning(
+      `Failed to fetch checksum for ${url}: ${e?.toString()}, skipping verification.`,
+    );
+    return;
+  }
+  if (!response.ok) {
+    logWarning(`Failed to fetch checksum for ${url}, skipping verification.`);
+    return;
+  }
+  const expected = (await response.text()).trim().split(/\s+/)[0];
+  if (expected.toLowerCase() !== actual.toLowerCase()) {
+    return await ctx.crash({
+      exitCode: 1,
+      errorType: "fatal",
+      printedMessage: `Checksum mismatch for ${url}. Expected ${expected}, got ${actual}.`,
+      errForSentry: new LocalDeploymentError(
+        `Checksum mismatch for ${url}. Expected ${expected}, got ${actual}.`,
+      ),
+    });
+  }
+  logVerbose("Checksum verified");
 }
 
 export async function ensureDashboardDownloaded(ctx: Context, version: string) {

@@ -222,7 +222,9 @@ fn main() -> anyhow::Result<()> {
             let database = database.clone();
             let wasm = rust_wasm.clone();
             let name = rust_descriptor.name.clone();
-            runner.get_or_compile_module(&wasm, &WasmLimits::default())?;
+            runner
+                .get_or_compile_module(&wasm, &WasmLimits::default())
+                .await?;
             bench("Rust WASM: echo (warm)", iterations, move || {
                 let runner = runner.clone();
                 let database = database.clone();
@@ -240,7 +242,9 @@ fn main() -> anyhow::Result<()> {
             let database = database.clone();
             let wasm = go_wasm.clone();
             let name = go_descriptor.name.clone();
-            runner.get_or_compile_module(&wasm, &WasmLimits::default())?;
+            runner
+                .get_or_compile_module(&wasm, &WasmLimits::default())
+                .await?;
             bench("Go WASM: echo (warm)", iterations, move || {
                 let runner = runner.clone();
                 let database = database.clone();

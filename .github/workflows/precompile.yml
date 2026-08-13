@@ -52,6 +52,11 @@ jobs:
         run: |
           cd npm-packages/dashboard-self-hosted/out && zip -r ../../../dashboard.zip .
 
+      - name: Compute dashboard checksum
+        shell: bash
+        run: |
+          sha256sum dashboard.zip | awk '{print $1}' > dashboard.zip.sha256
+
       - name: Precompute release name
         id: release_name
         shell: bash
@@ -64,6 +69,7 @@ jobs:
         with:
           files: |
             dashboard.zip
+            dashboard.zip.sha256
           tag_name: precompiled-${{ steps.release_name.outputs.RELEASE_NAME }}
           name: Precompiled ${{ steps.release_name.outputs.RELEASE_NAME }}
           draft: false
@@ -191,12 +197,18 @@ jobs:
           filename: ${{ steps.release_name.outputs.ZIP_NAME }}
           path: ${{ steps.release_name.outputs.BINARY_NAME }}
 
+      - name: Compute zip checksum
+        shell: bash
+        run: |
+          sha256sum ${{ steps.release_name.outputs.ZIP_NAME }} | awk '{print $1}' > ${{ steps.release_name.outputs.ZIP_NAME }}.sha256
+
       - name: Create Upload Precompiled Artifacts
         id: create_release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             ${{ steps.release_name.outputs.ZIP_NAME }}
+            ${{ steps.release_name.outputs.ZIP_NAME }}.sha256
             LICENSE.md
           tag_name: precompiled-${{ steps.release_name.outputs.RELEASE_NAME }}
           name: Precompiled ${{ steps.release_name.outputs.RELEASE_NAME }}

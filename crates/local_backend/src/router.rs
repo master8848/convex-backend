@@ -10,6 +10,7 @@ use axum::{
         DefaultBodyLimit,
         FromRef,
     },
+    response::IntoResponse,
     routing::{
         get,
         post,
@@ -24,17 +25,25 @@ use common::{
             FromMtState,
             MtState,
         },
+        HttpResponseError,
     },
     knobs::{
         AIRBYTE_STREAMING_IMPORT_REQUEST_SIZE_LIMIT,
+        ALLOW_UNAUTHENTICATED_METRICS,
         MAX_BACKEND_RPC_REQUEST_SIZE,
         MAX_ECHO_BYTES,
         MAX_PUSH_BYTES,
     },
 };
 use http::{
+    HeaderValue,
     Method,
     StatusCode,
+};
+use http_body_util::Limited;
+use keybroker::{
+    bad_admin_key_error,
+    Identity,
 };
 use metrics::SERVER_VERSION_STR;
 use tower::ServiceBuilder;
@@ -71,6 +80,7 @@ use crate::{
         table_rate,
         udf_rate,
     },
+    authentication::ExtractIdentity,
     canonical_urls::update_canonical_url,
     dashboard::{
         common_dashboard_api_router,
@@ -338,6 +348,11 @@ pub fn router(st: LocalAppState) -> Router {
                 .layer(HandleErrorLayer::new(|_: Infallible| async {
                     StatusCode::INTERNAL_SERVER_ERROR
                 }))
+                // Request bodies are decompressed (streaming, uncapped) by
+                // RequestDecompressionLayer, so cap the decompressed size to
+                // the same limit as the compressed one to prevent
+                // decompression-bomb memory exhaustion.
+                .layer(tower::util::MapRequestLayer::new(limit_decompressed_body))
                 .layer(RequestDecompressionLayer::new())
                 .layer(DefaultBodyLimit::max(*MAX_PUSH_BYTES)),
         )
@@ -347,7 +362,7 @@ pub fn router(st: LocalAppState) -> Router {
         .route("/stream_udf_execution", get(stream_udf_execution))
         .route("/stream_function_logs", get(stream_function_logs))
         .merge(import_routes())
-        .layer(cli_cors());
+        .layer(cli_cors(&st.allowed_origins));
 
     let snapshot_export_routes = Router::new()
         .route("/request/zip", post(request_zip_export))
@@ -402,7 +417,7 @@ pub fn router(st: LocalAppState) -> Router {
         .nest("/storage", storage_api_routes());
     let migrated = Router::new()
         .nest("/api", migrated_api_routes)
-        .layer(cors())
+        .layer(cors(&st.allowed_origins))
         // Order matters. Layers only apply to routes above them.
         // Notably, any layers added here won't apply to common routes
         // added inside `serve_http`
@@ -411,16 +426,38 @@ pub fn router(st: LocalAppState) -> Router {
             api: Arc::new(st.application.clone()),
             runtime: st.application.runtime(),
             subscription_reconnect_rate_limiter: None,
+            allowed_origins: st.allowed_origins.clone(),
         });
 
     let version = SERVER_VERSION_STR.to_string();
 
+    let version_for_route = version.clone();
     Router::new()
+        .route("/version", get(move || async move { version_for_route }))
+        .route("/metrics", get(metrics_handler))
         .nest("/api", api_routes)
-        .merge(health_check_routes(version))
-        .layer(cors())
+        .merge(health_check_routes(version, &st.allowed_origins))
+        .layer(cors(&st.allowed_origins))
         .with_state(st)
         .merge(migrated)
+}
+
+/// Serve Prometheus metrics. By default requires an admin key; set
+/// `CONVEX_ALLOW_UNAUTHENTICATED_METRICS` to allow unauthenticated scraping.
+async fn metrics_handler(
+    MtState(_st): MtState<LocalAppState>,
+    ExtractIdentity(identity): ExtractIdentity,
+) -> Result<impl IntoResponse, HttpResponseError> {
+    if *ALLOW_UNAUTHENTICATED_METRICS {
+        return common::http::metrics().await;
+    }
+    match &identity {
+        Identity::DeploymentAdmin(_) | Identity::ActingUser(..) => {},
+        _ => {
+            return Err(anyhow::anyhow!(bad_admin_key_error(identity.instance_name())).into());
+        },
+    };
+    common::http::metrics().await
 }
 
 pub fn public_api_routes<S>() -> Router<S>
@@ -531,7 +568,7 @@ where
         .nest("/app_metrics", app_metrics_routes())
 }
 
-pub fn health_check_routes<S>(version: String) -> Router<S>
+pub fn health_check_routes<S>(version: String, allowed_origins: &[String]) -> Router<S>
 where
     LocalAppState: FromMtState<S>,
     S: Clone + Send + Sync + 'static,
@@ -552,7 +589,7 @@ where
         // Limit requests to 128MiB to help mitigate DDoS attacks.
         .layer(DefaultBodyLimit::max(*MAX_ECHO_BYTES)),
         )
-        .layer(cors())
+        .layer(cors(allowed_origins))
 }
 
 // IMPORTANT NOTE: Those routes are proxied by Usher. Any changes to the router,
@@ -604,7 +641,7 @@ where
         .route("/get_table_column_names", get(get_table_column_names))
 }
 
-pub fn cors() -> CorsLayer {
+pub fn cors(allowed_origins: &[String]) -> CorsLayer {
     CorsLayer::new()
         .allow_headers(AllowHeaders::mirror_request())
         .allow_credentials(true)
@@ -616,6 +653,19 @@ pub fn cors() -> CorsLayer {
             Method::DELETE,
             Method::PUT,
         ])
-        .allow_origin(AllowOrigin::mirror_request())
+        .allow_origin(AllowOrigin::list(
+            allowed_origins
+                .iter()
+                .filter_map(|origin| HeaderValue::from_str(origin).ok())
+                .collect::<Vec<_>>(),
+        ))
         .max_age(Duration::from_secs(86400))
+}
+
+/// Cap the size of an (already decompressed) request body. Used with
+/// `RequestDecompressionLayer`, which streams decompression with no limit on
+/// the decompressed size, to prevent decompression-bomb memory exhaustion.
+fn limit_decompressed_body<B>(req: http::Request<B>) -> http::Request<Limited<B>> {
+    let (parts, body) = req.into_parts();
+    http::Request::from_parts(parts, Limited::new(body, *MAX_PUSH_BYTES))
 }

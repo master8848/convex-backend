@@ -64,6 +64,7 @@ use mysql_async::{
     PoolConstraints,
     PoolOpts,
     Row,
+    SslOpts,
     TxOpts,
     Value as MySqlValue,
 };
@@ -645,23 +646,29 @@ impl<RT: Runtime> ConvexMySqlPool<RT> {
                 .boxed()
             }));
         }
-        // The MYSQL_CA_FILE environment variable implicitly enables TLS unless
-        // the URL specifies require_ssl=false
-        if let Some(ca_file_path) = env::var_os("MYSQL_CA_FILE")
-            && !ca_file_path.is_empty()
+        // TLS is required by default. `MYSQL_CA_FILE` configures the CA to
+        // verify the server against; otherwise the system's built-in root
+        // certificates are used. Set `MYSQL_TLS_REQUIRED=false` or pass
+        // `require_ssl=false` in the URL to disable TLS.
+        let tls_required = env::var("MYSQL_TLS_REQUIRED").as_deref() != Ok("false")
             && !url
                 .query_pairs()
-                .any(|(k, v)| k == "require_ssl" && v == "false")
-        {
-            let ca_file_path = PathBuf::from(ca_file_path);
-            anyhow::ensure!(
-                ca_file_path.exists(),
-                "MYSQL_CA_FILE does not exist: {}",
-                ca_file_path.display()
-            );
-            let ssl_opts = ssl_opts
-                .unwrap_or_default()
-                .with_root_certs(vec![ca_file_path.into()]);
+                .any(|(k, v)| k == "require_ssl" && v == "false");
+        if tls_required {
+            let ssl_opts = match env::var_os("MYSQL_CA_FILE") {
+                Some(ca_file_path) if !ca_file_path.is_empty() => {
+                    let ca_file_path = PathBuf::from(ca_file_path);
+                    anyhow::ensure!(
+                        ca_file_path.exists(),
+                        "MYSQL_CA_FILE does not exist: {}",
+                        ca_file_path.display()
+                    );
+                    ssl_opts
+                        .unwrap_or_default()
+                        .with_root_certs(vec![ca_file_path.into()])
+                },
+                _ => ssl_opts.unwrap_or_else(SslOpts::default),
+            };
             opts = opts.ssl_opts(ssl_opts);
         }
         Ok(Self {

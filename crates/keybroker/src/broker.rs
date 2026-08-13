@@ -135,6 +135,7 @@ pub struct KeyBroker {
     data_sync_encryptor: RandomEncryptor,
     journal_encryptor: RandomEncryptor,
     store_file_encryptor: RandomEncryptor,
+    client_driven_upload_encryptor: RandomEncryptor,
 }
 
 // This enum encodes a successful authentication decision, and its nontrivial
@@ -898,6 +899,16 @@ pub fn cursor_parse_error() -> ErrorMetadata {
     ErrorMetadata::bad_request("InvalidCursor", "Failed to parse cursor")
 }
 
+/// Must match `LEGACY_LOCAL_BACKEND_INSTANCE_SECRET` in the CLI
+/// (npm-packages/convex/src/cli/lib/localDeployment/secrets.ts), since
+/// admin keys issued here are sent to backends launched by the CLI with
+/// that secret.
+///
+/// This is a committed, well-known constant: backends must only use it
+/// when bound to a loopback interface (see `LocalConfig::secret` in
+/// local_backend).
+pub const LEGACY_LOCAL_DEV_SECRET: &str = include_str!("../dev/secret.txt");
+
 impl KeyBroker {
     pub fn new(instance_name: &str, deployment_secret: DeploymentSecret) -> anyhow::Result<Self> {
         Ok(Self {
@@ -927,6 +938,10 @@ impl KeyBroker {
                 &deployment_secret,
                 Purpose::STORE_FILE_AUTHORIZATION,
             )?,
+            client_driven_upload_encryptor: RandomEncryptor::derive_from_secret(
+                &deployment_secret,
+                Purpose::CLIENT_DRIVEN_UPLOAD,
+            )?,
         })
     }
 
@@ -935,13 +950,9 @@ impl KeyBroker {
     }
 
     pub fn local_dev(instance_name: &str) -> Self {
-        // Must match `LEGACY_LOCAL_BACKEND_INSTANCE_SECRET` in the CLI
-        // (npm-packages/convex/src/cli/lib/localDeployment/auth.ts), since admin
-        // keys issued here are sent to backends launched by the CLI with that secret.
-        const LOCAL_DEV_SECRET: &str = include_str!("../dev/secret.txt");
         Self::new(
             instance_name,
-            DeploymentSecret::try_from(LOCAL_DEV_SECRET).unwrap(),
+            DeploymentSecret::try_from(LEGACY_LOCAL_DEV_SECRET).unwrap(),
         )
         .unwrap()
     }
@@ -949,6 +960,11 @@ impl KeyBroker {
     /// Encryptor for data sync (streaming export) cursors.
     pub fn data_sync_encryptor(&self) -> &RandomEncryptor {
         &self.data_sync_encryptor
+    }
+
+    /// Encryptor for client driven upload tokens.
+    pub fn client_driven_upload_encryptor(&self) -> &RandomEncryptor {
+        &self.client_driven_upload_encryptor
     }
 
     pub fn function_runner_keybroker(&self) -> FunctionRunnerKeyBroker {
@@ -960,15 +976,19 @@ impl KeyBroker {
     }
 
     pub fn issue_admin_key(&self, member_id: MemberId) -> AdminKey {
-        AdminKey::new(self.issue_key(Some(member_id), false))
+        AdminKey::new(self.issue_key(Some(member_id), false, None))
+    }
+
+    pub fn issue_admin_key_with_expiry(&self, member_id: MemberId, expires_s: u64) -> AdminKey {
+        AdminKey::new(self.issue_key(Some(member_id), false, Some(expires_s)))
     }
 
     pub fn issue_read_only_admin_key(&self, member_id: MemberId) -> AdminKey {
-        AdminKey::new(self.issue_key(Some(member_id), true))
+        AdminKey::new(self.issue_key(Some(member_id), true, None))
     }
 
     pub fn issue_system_key(&self) -> SystemKey {
-        SystemKey::new(self.issue_key(None, false))
+        SystemKey::new(self.issue_key(None, false, None))
     }
 
     pub fn issue_store_file_authorization<RT: Runtime>(
@@ -984,7 +1004,14 @@ impl KeyBroker {
     /// Private helper method to generate an admin key.
     /// If `member_id` is None, it generates a system key, otherwise
     /// an admin key for the given user.
-    fn issue_key(&self, member_id: Option<MemberId>, is_read_only: bool) -> String {
+    /// If `expires_s` is set, the key stops being valid after that unix
+    /// timestamp.
+    fn issue_key(
+        &self,
+        member_id: Option<MemberId>,
+        is_read_only: bool,
+        expires_s: Option<u64>,
+    ) -> String {
         let now = SystemTime::now();
         let since_epoch = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -997,6 +1024,7 @@ impl KeyBroker {
         let proto = AdminKeyProto {
             instance_name: None,
             issued_s: since_epoch.as_secs(),
+            expires_s,
             identity: Some(identity),
             is_read_only,
         };
@@ -1030,6 +1058,7 @@ impl KeyBroker {
             issued_s,
             identity,
             is_read_only,
+            expires_s,
         } = self
             .admin_key_encryptor
             .decrypt_proto(ADMIN_KEY_VERSION, encrypted_part)
@@ -1049,6 +1078,13 @@ impl KeyBroker {
             ));
         }
         anyhow::ensure!(issued_s != 0, "Proto missing issued_s");
+        if let Some(expires_s) = expires_s {
+            let now_s = now
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .context("Failed to compute seconds since epoch?")?
+                .as_secs();
+            anyhow::ensure!(now_s < expires_s, "Admin key expired");
+        }
         let identity = identity.context("Proto missing identity")?;
 
         let issued = DateTime::from_timestamp(issued_s as i64, 0);

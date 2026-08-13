@@ -13,6 +13,10 @@ pub const DEFAULT_MAX_CALL_DATA: usize = 16 * 1024 * 1024;
 pub const DEFAULT_FUEL: u64 = 10_000_000_000;
 /// The default wall-clock timeout for queries and mutations.
 pub const DEFAULT_USER_TIMEOUT: Duration = Duration::from_secs(30);
+/// The default wall-clock timeout for compiling a module binary. Cranelift
+/// compilation is CPU-bound and can take seconds for large modules, so it is
+/// bounded separately from execution.
+pub const DEFAULT_COMPILE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resource limits applied to a single WASM UDF execution.
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +33,9 @@ pub struct WasmLimits {
     /// limit: it also covers time spent blocked inside host functions, which
     /// fuel does not account for.
     pub timeout: Duration,
+    /// Wall-clock timeout for compiling a module binary. Compilation happens
+    /// once per unique module (results are cached), off the async runtime.
+    pub compile_timeout: Duration,
 }
 
 impl Default for WasmLimits {
@@ -39,6 +46,7 @@ impl Default for WasmLimits {
             max_call_data: DEFAULT_MAX_CALL_DATA,
             fuel: DEFAULT_FUEL,
             timeout: DEFAULT_USER_TIMEOUT,
+            compile_timeout: DEFAULT_COMPILE_TIMEOUT,
         }
     }
 }

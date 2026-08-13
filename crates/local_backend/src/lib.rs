@@ -125,6 +125,8 @@ pub struct LocalAppState {
     pub instance_name: String,
     pub application: Application<ProdRuntime>,
     pub zombify_rx: async_broadcast::Receiver<()>,
+    // Origins allowed to make browser requests (CORS and WebSocket upgrades).
+    pub allowed_origins: Vec<String>,
 }
 
 impl LocalAppState {
@@ -143,6 +145,8 @@ pub struct RouterState {
     pub api: Arc<dyn ApplicationApi>,
     pub runtime: ProdRuntime,
     pub subscription_reconnect_rate_limiter: Option<Arc<SubscriptionReconnectRateLimiter>>,
+    // Origins allowed to make browser requests (CORS and WebSocket upgrades).
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -183,6 +187,7 @@ pub async fn make_app(
         &database,
         config.storage_tag_initializer(),
         config.name(),
+        key_broker.client_driven_upload_encryptor(),
     )
     .await?;
 
@@ -213,7 +218,9 @@ pub async fn make_app(
     #[cfg(not(debug_assertions))]
     if config.convex_http_proxy.is_none() {
         tracing::warn!(
-            "Running without a proxy in release mode -- UDF `fetch` requests are unrestricted!"
+            "Running without a proxy in release mode -- UDF `fetch` requests are screened only by \
+             the built-in SSRF denylist. Set CONVEX_ALLOW_PRIVATE_FETCH_IPS to disable it, or \
+             configure --convex-http-proxy to route fetches through a screening proxy."
         );
     }
     let fetch_client = Arc::new(ProxiedFetchClient::new(
@@ -299,6 +306,7 @@ pub async fn make_app(
         instance_name,
         application,
         zombify_rx,
+        allowed_origins: config.allowed_origins.clone(),
     };
 
     Ok(app_state)

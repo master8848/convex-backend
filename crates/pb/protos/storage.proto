@@ -16,3 +16,8 @@ message FileStorageEntry {
   optional int64 size = 4;
   optional string content_type = 5;
 }
+
+message ClientDrivenUpload {
+  string object_key = 1;
+  string filepath = 2;
+}

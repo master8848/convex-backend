@@ -91,7 +91,10 @@ fn find_kotlin_wasm(dir: &str) -> anyhow::Result<std::path::PathBuf> {
             if path.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 // Skip caches and Node tooling (may contain unrelated .wasm).
-                if matches!(name, ".gradle" | ".kotlin" | "kotlin-js-store" | "node_modules") {
+                if matches!(
+                    name,
+                    ".gradle" | ".kotlin" | "kotlin-js-store" | "node_modules"
+                ) {
                     continue;
                 }
                 walk(&path, out)?;
@@ -242,7 +245,9 @@ fn test_kotlin_guest_end_to_end() -> anyhow::Result<()> {
         assert!(result.result.is_err());
 
         // descriptor analysis
-        let module = runner.get_or_compile_module(&module_binary, &WasmLimits::default())?;
+        let module = runner
+            .get_or_compile_module(&module_binary, &WasmLimits::default())
+            .await?;
         let tx = database.begin(Identity::Unknown(None)).await?;
         let functions = wasm_runner::analyze_functions(
             &runner,

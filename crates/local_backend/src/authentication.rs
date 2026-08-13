@@ -12,10 +12,7 @@ use axum::{
 };
 use common::{
     http::{
-        extract::{
-            FromMtState,
-            Query,
-        },
+        extract::FromMtState,
         ExtractRequestId,
         ExtractRequestMetadata,
         ExtractResolvedHostname,
@@ -27,7 +24,6 @@ use common::{
 };
 use errors::ErrorMetadata;
 use keybroker::Identity;
-use serde::Deserialize;
 use sync_types::{
     AuthenticationToken,
     UserIdentityAttributes,
@@ -78,19 +74,6 @@ impl<T: Sync> FromRequestParts<T> for ExtractAuthenticationToken {
                     .unwrap();
                 Ok(Self(AuthenticationToken::User(auth)))
             };
-        }
-
-        // If no header is provided, also allow extracting admin key from query param.
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct QueryParams {
-            admin_key: Option<String>,
-        }
-        if let Query(QueryParams {
-            admin_key: Some(admin_key),
-        }) = parts.extract().await?
-        {
-            return Ok(Self(AuthenticationToken::Admin(admin_key, None)));
         }
 
         Ok(Self(AuthenticationToken::None))

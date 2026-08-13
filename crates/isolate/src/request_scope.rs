@@ -342,7 +342,9 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
                 .into(),
             );
             let message = uncatchable_error.js_error.message.to_string();
-            let message_v8 = v8::String::new(scope, &message[..]).unwrap();
+            let Some(message_v8) = v8::String::new(scope, &message[..]) else {
+                return;
+            };
             let exception = v8::Exception::error(scope, message_v8);
             scope.throw_exception(exception);
             return;
@@ -361,7 +363,9 @@ impl<'a, 's: 'a, 'i: 'a, RT: Runtime, E: V8IsolateEnvironment<RT>> RequestScope<
 
         if err.is_deterministic_user_error() {
             let message = err.user_facing_message();
-            let message_v8 = v8::String::new(scope, &message[..]).unwrap();
+            let Some(message_v8) = v8::String::new(scope, &message[..]) else {
+                return;
+            };
             let exception = v8::Exception::error(scope, message_v8);
             scope.throw_exception(exception);
             return;
