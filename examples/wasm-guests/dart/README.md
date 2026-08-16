@@ -3,8 +3,9 @@
 Status: 🚧 **in progress**. `dart compile wasm` emits WasmGC modules. The runner
 (crates/wasm_runner) uses wasmtime 47, and the GC spike
 (crates/wasm_runner/examples/gc_spike.rs) has proven wasmtime 47 compiles and
-runs WasmGC modules (struct/array/i31/ref) with the runner's exact Config —
-see docs/wasm.md and the dart-wasm worklog (docs/dart-wasm-WORKLOG.md).
+runs WasmGC modules (struct/array/i31/ref) with the runner's exact Config — see
+docs/wasm.md and docs/dart-guest.md; the worklog record lives in
+.agents/notes/implemented/feature/2026-08-11-dart-guest-feasibility-workaround.md.
 
 What lands here once validated end-to-end:
 
@@ -14,6 +15,6 @@ What lands here once validated end-to-end:
 - build command + `make dart` wiring
 - an end-to-end test in crates/wasm_runner/tests/end_to_end.rs
 
-Until then, the fastest path for Dart developers is the **C++ template**:
-Dart FFI can drive a small C++ engine guest compiled with the cpp example's
-build line.
+Until then, the fastest path for Dart developers is the **C++ template**: Dart
+FFI can drive a small C++ engine guest compiled with the cpp example's build
+line.

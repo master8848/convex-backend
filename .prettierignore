@@ -6,6 +6,10 @@ dist/
 .netlify/
 .docusaurus/
 .mypy_cache/
+# dsh-format docs: one physical line per paragraph (see docs/AGENTS.md) —
+# prettier's proseWrap: "always" would rewrap them
+docs/**/*.md
+.agents/**/*.md
 .pytest_cache/
 .venv/
 .context/
