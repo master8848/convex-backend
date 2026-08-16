@@ -285,7 +285,7 @@ pub(crate) async fn db_replace<RT: Runtime>(shared: &DbShared<RT>, args: &[u8]) 
             .replace(id, value)
             .await
             .context("db.replace")?;
-        developer_document_to_json(&mut tx, namespace, &document, WriteTimestamp::Pending)
+        Ok(document.to_uncommitted_internal_json())
     }
     .await;
     write_result(shared, result).await
@@ -310,7 +310,7 @@ pub(crate) async fn db_patch<RT: Runtime>(shared: &DbShared<RT>, args: &[u8]) ->
             .patch(id, value)
             .await
             .context("db.patch")?;
-        developer_document_to_json(&mut tx, namespace, &document, WriteTimestamp::Pending)
+        Ok(document.to_uncommitted_internal_json())
     }
     .await;
     write_result(shared, result).await
