@@ -71,6 +71,7 @@ async fn load_database(
         index_cache,
         retention_rate_limiter,
         deleted_tablet_tx,
+        String::from("test"),
     )
     .await?;
     Ok(db)
