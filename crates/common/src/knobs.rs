@@ -166,6 +166,12 @@ pub static APP_METRICS_SEED_STARTUP_JITTER: LazyLock<Duration> = LazyLock::new(|
 pub static KILL_APP_METRICS_SEED_WORKER: LazyLock<bool> =
     LazyLock::new(|| env_config("KILL_APP_METRICS_SEED_WORKER", false));
 
+/// Minimum spacing between a deployment's deploy reports to big brain. Deploys
+/// landing within this window of the previous report coalesce into a single
+/// request carrying the newest deploy time.
+pub static DEPLOY_REPORT_MIN_INTERVAL: LazyLock<Duration> =
+    LazyLock::new(|| Duration::from_secs(env_config("DEPLOY_REPORT_MIN_INTERVAL_SECS", 2)));
+
 /// Databricks query id (UUID) for the conductor app-metrics seed query, which
 /// takes a comma-separated `instance_names` parameter and returns rolled up
 /// usage data. Defaults to the the empty string, which means the worker will be
@@ -1495,6 +1501,14 @@ pub static USAGE_TRACKING_WORKER_SLOW_TRACE_THRESHOLD: LazyLock<Duration> = Lazy
         120,
     ))
 });
+
+/// How many `_file_storage` documents the deployment must hold before the
+/// usage gauges' file storage total resumes from its previous sync rather than
+/// syncing the storage tables again. Resuming catches up along the document
+/// log, which reads every table's revisions in the timestamp range, not just
+/// `_file_storage`'s, so below this many documents a fresh sync is cheaper.
+pub static FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME: LazyLock<i64> =
+    LazyLock::new(|| env_config("FILE_STORAGE_SIZE_MIN_DOCUMENTS_TO_RESUME", 4096));
 
 /// The number of events we can accumulate in the buffer that's used to send
 /// events from our business logic to our firehose client.

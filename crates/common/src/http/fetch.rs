@@ -50,6 +50,14 @@ pub trait FetchClient: Send + Sync {
     async fn fetch(&self, request: HttpRequestStream) -> anyhow::Result<HttpResponseStream>;
 }
 
+/// The request's `AbortSignal` fired before the fetch (or the read of its
+/// response body) completed. Layers closer to JS translate this into a
+/// `DOMException` named `AbortError`, which is what the fetch spec requires and
+/// what SDKs check for.
+#[derive(Debug, thiserror::Error)]
+#[error("The signal has been aborted")]
+pub struct FetchAborted;
+
 // Share the underlying TlsConnector between ProxiedFetchClients
 static TLS_CONNECTOR: LazyLock<native_tls::TlsConnector> = LazyLock::new(|| {
     let mut tls = native_tls::TlsConnector::builder();

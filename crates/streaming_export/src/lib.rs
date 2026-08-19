@@ -5,9 +5,9 @@
 //! opaque cursor.
 //!
 //! This is the forward-looking replacement for the `list_snapshot` /
-//! `document_deltas` APIs (still on [`Database`]). It lives in its own crate,
-//! driving [`Database`] through its public API, so other call sites (e.g. the
-//! search flusher, backups) can depend on it directly.
+//! `document_deltas` APIs (still on `Database`). It lives in its own crate and
+//! reads through a [`DatabaseSnapshot`] rather than a live `Database`, so call
+//! sites without one (e.g. offline tools, backups) can depend on it directly.
 //!
 //! See <https://app.notion.com/p/convex-dev/Robust-Streaming-Export-API-36db57ff32ab80c68d97e01c578518d4>
 
@@ -33,11 +33,11 @@ use common::{
 use database::{
     streaming_export_selection::StreamingExportDocument,
     unauthorized_error,
-    BootstrapComponentsModel,
-    Database,
-    IndexModel,
+    DatabaseSnapshot,
+    Snapshot,
     StreamingExportFilter,
 };
+use errors::ErrorMetadata;
 use keybroker::{
     Identity,
     RandomEncryptor,
@@ -369,6 +369,57 @@ fn table_included(
         .is_table_included(component_path, table_name))
 }
 
+/// The tablets a [`StreamingExportFilter`] selects, resolved against a snapshot
+/// to concrete tablet ids. Tablet ids are stable, so this stays valid for the
+/// iterator's own (possibly slightly newer) read snapshot.
+struct ResolvedStreamingExportFilter {
+    /// The selected tablets, each mapped to its `by_id` index.
+    target_tables: BTreeMap<TabletId, IndexId>,
+}
+
+impl ResolvedStreamingExportFilter {
+    fn new(snapshot: &Snapshot, filter: &StreamingExportFilter) -> anyhow::Result<Self> {
+        let table_mapping = snapshot.table_mapping();
+        let component_paths = snapshot.component_ids_to_paths();
+        let by_id_indexes = snapshot.index_registry.by_id_indexes();
+
+        let mut target_tables: BTreeMap<TabletId, IndexId> = BTreeMap::new();
+        for (tablet_id, ..) in table_mapping.iter() {
+            if !table_included(filter, tablet_id, table_mapping, &component_paths)? {
+                continue;
+            }
+            let by_id = *by_id_indexes
+                .get(&tablet_id)
+                .ok_or_else(|| anyhow::anyhow!("by_id index for {tablet_id:?} missing"))?;
+            target_tables.insert(tablet_id, by_id);
+        }
+
+        Ok(Self { target_tables })
+    }
+}
+
+/// Resolves a tablet to the (component, table) name it is exported under.
+fn resolve_name(
+    snapshot: &Snapshot,
+    component_paths: &BTreeMap<ComponentId, ComponentPath>,
+    tablet_id: TabletId,
+) -> anyhow::Result<(ComponentPath, TableName)> {
+    let table_mapping = snapshot.table_mapping();
+    let table_name = table_mapping.tablet_name(tablet_id)?;
+    let component_id = ComponentId::from(table_mapping.tablet_namespace(tablet_id)?);
+    let component_path = component_paths
+        .get(&component_id)
+        .cloned()
+        .unwrap_or_else(ComponentPath::root);
+    Ok((component_path, table_name))
+}
+
+/// Mint a fresh sync id for a cold start, tagged with the integration that
+/// issued it so `/data/list_active_syncs` can tell syncs apart.
+fn new_sync_id<RT: Runtime>(runtime: &RT, sync_client: DataSyncClient) -> String {
+    format!("{}{}", sync_client.sync_id_prefix(), runtime.new_uuid_v4())
+}
+
 /// Produce the next page of a streaming export ("data sync").
 ///
 /// `cursor: None` starts a fresh sync. `filter` selects the components, tables
@@ -380,7 +431,7 @@ fn table_included(
 /// on that page.
 #[fastrace::trace]
 pub async fn data_sync<RT: Runtime>(
-    database: &Database<RT>,
+    db_snapshot: &DatabaseSnapshot<RT>,
     identity: Identity,
     cursor: Option<SyncCursor>,
     filter: StreamingExportFilter,
@@ -394,45 +445,13 @@ pub async fn data_sync<RT: Runtime>(
         unauthorized_error("data_sync")
     );
 
-    // Resolve the filter to concrete tablets at a recent, consistent snapshot.
-    // Tablet ids are stable, so this mapping is valid for the iterator's own
-    // (possibly slightly newer) `latest` timestamp.
-    let (begin_ts, table_mapping, component_paths, by_id_indexes, table_counts) = {
-        let mut tx = database.begin(identity).await?;
-        let table_mapping = tx.table_mapping().clone();
-        let component_paths = BootstrapComponentsModel::new(&mut tx).all_component_paths();
-        let by_id_indexes = IndexModel::new(&mut tx).by_id_indexes().await?;
-        // Incrementally-maintained per-table document counts, used only for
-        // progress reporting. `None` while table summaries are bootstrapping.
-        let table_counts = database.snapshot(tx.begin_timestamp())?.table_counts;
-        (
-            tx.begin_timestamp(),
-            table_mapping,
-            component_paths,
-            by_id_indexes,
-            table_counts,
-        )
-    };
-    let resolve_name = |tablet_id: TabletId| -> anyhow::Result<(ComponentPath, TableName)> {
-        let table_name = table_mapping.tablet_name(tablet_id)?;
-        let component_id = ComponentId::from(table_mapping.tablet_namespace(tablet_id)?);
-        let component_path = component_paths
-            .get(&component_id)
-            .cloned()
-            .unwrap_or_else(ComponentPath::root);
-        Ok((component_path, table_name))
-    };
-
-    let mut target_tables: BTreeMap<TabletId, IndexId> = BTreeMap::new();
-    for (tablet_id, ..) in table_mapping.iter() {
-        if !table_included(&filter, tablet_id, &table_mapping, &component_paths)? {
-            continue;
-        }
-        let by_id = *by_id_indexes
-            .get(&tablet_id)
-            .ok_or_else(|| anyhow::anyhow!("by_id index for {tablet_id:?} missing"))?;
-        target_tables.insert(tablet_id, by_id);
-    }
+    // Resolve the filter against `db_snapshot`'s consistent snapshot. Tablet ids
+    // are stable, so the mapping stays valid for the iterator's own (possibly
+    // slightly newer) read snapshot.
+    let snapshot = &db_snapshot.snapshot;
+    let component_paths = snapshot.component_ids_to_paths();
+    let target_tables = ResolvedStreamingExportFilter::new(snapshot, &filter)?.target_tables;
+    let resolve_name = |tablet_id: TabletId| resolve_name(snapshot, &component_paths, tablet_id);
 
     // The tablets the cursor was tracking (synced plus in-progress) before this
     // page, with the names they resolved to when captured. Compared against the
@@ -446,16 +465,10 @@ pub async fn data_sync<RT: Runtime>(
     let sync_id = cursor
         .as_ref()
         .map(|c| c.sync_id.clone())
-        .unwrap_or_else(|| {
-            format!(
-                "{}{}",
-                sync_client.sync_id_prefix(),
-                database.runtime().new_uuid_v4()
-            )
-        });
+        .unwrap_or_else(|| new_sync_id(db_snapshot.runtime(), sync_client));
 
     let mut entries = Vec::new();
-    let iterator = database.data_sync_iterator(begin_ts)?;
+    let iterator = db_snapshot.data_sync_iterator()?;
     let page = iterator
         .next_page(cursor.map(|c| c.inner), &target_tables)
         .await?;
@@ -482,7 +495,7 @@ pub async fn data_sync<RT: Runtime>(
                 });
             },
             None => {
-                let table_number = table_mapping.tablet_number(tablet_id)?;
+                let table_number = snapshot.table_mapping().tablet_number(tablet_id)?;
                 let developer_id = DeveloperDocumentId::new(table_number, id.internal_id());
                 entries.push(SyncEntry::Tombstone {
                     ts,
@@ -538,10 +551,11 @@ pub async fn data_sync<RT: Runtime>(
             let (current_component, current_table) = resolve_name(progress.current_table)?;
             // Progress denominators from the incrementally-maintained table
             // counts: no table scans, just map lookups.
-            let total_documents_in_current_table = table_counts
+            let total_documents_in_current_table = snapshot
+                .table_counts
                 .as_ref()
                 .map(|counts| counts.tablet_count(&progress.current_table).num_values());
-            let total_documents = table_counts.as_ref().map(|counts| {
+            let total_documents = snapshot.table_counts.as_ref().map(|counts| {
                 target_tables
                     .keys()
                     .map(|tablet_id| counts.tablet_count(tablet_id).num_values())
@@ -572,5 +586,61 @@ pub async fn data_sync<RT: Runtime>(
         },
         status,
         usage: usage.gather_user_stats(),
+    })
+}
+
+/// Convert a legacy `document_deltas` cursor to a [`SyncCursor`]
+#[fastrace::trace]
+pub async fn data_sync_cursor_from_deltas<RT: Runtime>(
+    db_snapshot: &DatabaseSnapshot<RT>,
+    identity: Identity,
+    ts: Timestamp,
+    filter: StreamingExportFilter,
+    sync_client: DataSyncClient,
+) -> anyhow::Result<SyncCursor> {
+    anyhow::ensure!(
+        identity.is_system() || identity.is_admin(),
+        unauthorized_error("data_sync_cursor_from_deltas")
+    );
+
+    anyhow::ensure!(
+        ts <= *db_snapshot.timestamp(),
+        ErrorMetadata::bad_request(
+            "InvalidDataSyncCursor",
+            "document_deltas cursor is ahead of the deployment's latest timestamp",
+        )
+    );
+    // The first `data_sync` page walks the document log forward from `ts`, so
+    // `ts` must still be within document retention. Fail here rather than on the
+    // first page so the caller learns the cursor is unusable before it starts.
+    db_snapshot
+        .retention_validator
+        .validate_document_snapshot(ts)
+        .await?;
+
+    let snapshot = &db_snapshot.snapshot;
+    let component_paths = snapshot.component_ids_to_paths();
+    let target_tables = ResolvedStreamingExportFilter::new(snapshot, &filter)?.target_tables;
+    let names = target_tables
+        .keys()
+        .map(|tablet_id| {
+            Ok((
+                *tablet_id,
+                resolve_name(snapshot, &component_paths, *tablet_id)?,
+            ))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+
+    Ok(SyncCursor {
+        inner: DataSyncCursor::from_parts(
+            ts,
+            target_tables.keys().copied().collect(),
+            // No in-progress table: the whole ID space is already synced.
+            None,
+            0,
+            0,
+        ),
+        names,
+        sync_id: new_sync_id(db_snapshot.runtime(), sync_client),
     })
 }

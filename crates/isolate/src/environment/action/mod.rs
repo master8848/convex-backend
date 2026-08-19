@@ -157,7 +157,7 @@ use crate::{
             MAX_LOG_LINES,
         },
         AsyncOpRequest,
-        IsolateEnvironment,
+        JsEnvironment,
         SyscallProvider,
     },
     execution_scope::ExecutionScope,
@@ -185,7 +185,7 @@ use crate::{
     strings,
     termination::{
         ContextTerminationReason,
-        IsolateHandle,
+        ExecutionHandle,
         IsolateTerminationReason,
     },
     timeout::{
@@ -994,7 +994,7 @@ impl<RT: Runtime> ActionEnvironment<RT> {
     async fn run_inner<'a, 's, 'i, T, S>(
         scope: &mut ExecutionScope<'a, 's, 'i, RT, Self>,
         timeout: &mut Timeout<RT>,
-        handle: IsolateHandle,
+        handle: ExecutionHandle,
         udf_type: UdfType,
         v8_function: v8::Local<'_, v8::Function>,
         v8_args: &[v8::Local<'_, v8::Value>],
@@ -1426,7 +1426,7 @@ impl<RT: Runtime> SyscallProvider<RT> for ActionEnvironment<RT> {
     }
 }
 
-impl<RT: Runtime> IsolateEnvironment<RT> for ActionEnvironment<RT> {
+impl<RT: Runtime> JsEnvironment<RT> for ActionEnvironment<RT> {
     type AsyncResolver = v8::Global<v8::PromiseResolver>;
     type SyscallProvider = Self;
 

@@ -82,7 +82,7 @@ impl<RT: Runtime> Application<RT> {
         request_metadata: RequestMetadata,
     ) -> anyhow::Result<SyncResult> {
         let result = streaming_export::data_sync(
-            &self.database,
+            &self.database.latest_database_snapshot()?,
             identity.clone(),
             cursor,
             StreamingExportFilter {
@@ -95,6 +95,29 @@ impl<RT: Runtime> Application<RT> {
         self.record_data_sync_progress(&result, identity, &request_metadata)
             .await?;
         Ok(result)
+    }
+
+    /// Mint a data sync cursor equivalent to a legacy `document_deltas` cursor,
+    /// letting a consumer switch protocols without re-reading its data.
+    #[fastrace::trace]
+    pub async fn data_sync_cursor_from_deltas(
+        &self,
+        identity: Identity,
+        cursor: Timestamp,
+        selection: StreamingExportSelection,
+        sync_client: DataSyncClient,
+    ) -> anyhow::Result<SyncCursor> {
+        streaming_export::data_sync_cursor_from_deltas(
+            &self.database.latest_database_snapshot()?,
+            identity,
+            cursor,
+            StreamingExportFilter {
+                selection,
+                ..Default::default()
+            },
+            sync_client,
+        )
+        .await
     }
 
     /// One page of the progress rows of active data syncs — those that

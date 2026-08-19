@@ -216,10 +216,6 @@ use crate::{
         ScheduledJobArgsTable,
         SCHEDULED_JOBS_ARGS_TABLE,
     },
-    scheduler_cursor::{
-        SchedulerCursorTable,
-        SCHEDULER_CURSOR_TABLE,
-    },
     usage_limits::{
         UsageLimitsTable,
         USAGE_LIMITS_INDEX_BY_SELECTOR,
@@ -250,7 +246,6 @@ mod metrics;
 pub mod migrations;
 pub mod modules;
 pub mod scheduled_jobs;
-pub mod scheduler_cursor;
 pub mod session_requests;
 pub mod snapshot_imports;
 pub mod source_packages;
@@ -297,10 +292,9 @@ enum DefaultTableNumber {
     AuditLogConfig = 39,
     UsageLimits = 40,
     DataSyncProgress = 41,
-    SchedulerCursor = 42,
     // Keep this number and your user name up to date. The number makes it easy to know
     // what to use next. The username on the same line detects merge conflicts
-    // Next Number - 43 - ayush
+    // Next Number - 42 - nipunn
 }
 
 impl From<DefaultTableNumber> for TableNumber {
@@ -348,7 +342,6 @@ impl From<DefaultTableNumber> for &'static dyn ErasedSystemTable {
             DefaultTableNumber::AuditLogConfig => &AuditLogConfigTable,
             DefaultTableNumber::UsageLimits => &UsageLimitsTable,
             DefaultTableNumber::DataSyncProgress => &DataSyncProgressTable,
-            DefaultTableNumber::SchedulerCursor => &SchedulerCursorTable,
         }
     }
 }
@@ -483,7 +476,11 @@ pub async fn initialize_application_system_table<RT: Runtime>(
         .await?;
     if is_new {
         for index in table.indexes() {
-            let index_metadata = IndexMetadata::new_enabled(index.name, index.fields);
+            let index_metadata = IndexMetadata::new_enabled(
+                index.name,
+                index.fields,
+                tx.allocate_persistence_index_id().await,
+            );
             IndexModel::new(tx)
                 .add_system_index(namespace, index_metadata)
                 .await?;
@@ -503,6 +500,7 @@ pub async fn initialize_application_system_table<RT: Runtime>(
                 let IndexConfig::Database {
                     spec,
                     on_disk_state: _,
+                    persistence_index_id: _,
                 } = &index.config
                 else {
                     // This isn't a strict requirement; it's just not implemented or needed.
@@ -542,6 +540,7 @@ pub async fn initialize_application_system_table<RT: Runtime>(
                         *tx.begin_timestamp(),
                         index.name.clone(),
                         index.fields.clone(),
+                        tx.allocate_persistence_index_id().await,
                     );
                     IndexModel::new(tx)
                         .add_system_index(namespace, index_metadata)
@@ -601,7 +600,6 @@ pub fn component_system_tables() -> Vec<&'static dyn ErasedSystemTable> {
         &FileStorageTable,
         &ScheduledJobsTable,
         &ScheduledJobArgsTable,
-        &SchedulerCursorTable,
         &CronJobsTable,
         &CronJobLogsTable,
         &CronNextRunTable,
@@ -621,7 +619,6 @@ static APP_TABLES_TO_LOAD_IN_MEMORY: LazyLock<BTreeSet<TableName>> = LazyLock::n
         CRON_JOBS_TABLE.clone(),
         CRON_NEXT_RUN_TABLE.clone(),
         BACKEND_STATE_TABLE.clone(),
-        SCHEDULER_CURSOR_TABLE.clone(),
         CANONICAL_URLS_TABLE.clone(),
         BACKEND_INFO_TABLE.clone(),
         AWS_LAMBDA_VERSIONS_TABLE.clone(),
@@ -679,7 +676,6 @@ pub static FIRST_SEEN_TABLE: LazyLock<BTreeMap<TableName, DatabaseVersion>> = La
         AUDIT_LOG_CONFIG_TABLE.clone() => 124,
         USAGE_LIMITS_TABLE.clone() => 126,
         DATA_SYNC_PROGRESS_TABLE.clone() => 127,
-        SCHEDULER_CURSOR_TABLE.clone() => 129,
     }
 });
 
