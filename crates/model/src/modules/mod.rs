@@ -68,6 +68,7 @@ use crate::{
 };
 
 pub mod function_validators;
+pub mod language;
 pub mod module_versions;
 pub mod types;
 pub mod user_error;

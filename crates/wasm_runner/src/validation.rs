@@ -109,6 +109,19 @@ const HOST_FUNCTIONS: &[&str] = &[
     DB_QUERY,
 ];
 
+/// Allowed Wasm guest extensions — one-home is `crates/model/src/modules/language.rs:ALL_WASM_EXTENSIONS`.
+/// Mirrored from `ModuleLanguage::ALL_WASM_EXTENSIONS` for validation allowlist.
+pub const ALLOWED_WASM_EXTENSIONS: &[&str] = &[".rs", ".go", ".zig", ".c", ".kt", ".dart", ".cs"];
+
+pub fn is_wasm_guest_path(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| format!(".{}", s.to_lowercase()))
+        .unwrap_or_default();
+    ALLOWED_WASM_EXTENSIONS.contains(&ext.as_str())
+}
+
 /// The page size of wasm linear memory.
 const WASM_PAGE_SIZE: u64 = 64 * 1024;
 

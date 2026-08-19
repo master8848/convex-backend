@@ -1,4 +1,9 @@
 use common::types::ModuleEnvironment;
+pub use super::language::{
+    is_wasm_environment,
+    ModuleLanguage,
+    ALL_WASM_EXTENSIONS,
+};
 use serde::{
     Deserialize,
     Serialize,

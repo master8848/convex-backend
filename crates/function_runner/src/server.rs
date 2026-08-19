@@ -73,6 +73,7 @@ use model::{
         EnvVarValue,
     },
     modules::{
+        language::is_wasm_environment,
         module_versions::{
             AnalyzedModule,
             ModuleSource,
@@ -419,11 +420,11 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 let rng_seed = self.rt.rng().random();
                 let unix_timestamp = self.rt.unix_timestamp();
                 // Route WASM before isolate. Per-env semaphore (64, GC 64+32MiB).
-                if self
-                    .module_environment(&mut transaction, path_and_args.path())
-                    .await?
-                    == ModuleEnvironment::Wasm
-                {
+                if is_wasm_environment(
+                    &self
+                        .module_environment(&mut transaction, path_and_args.path())
+                        .await?,
+                ) {
                     let _permit = self.wasm_runner.execution_semaphore_for_env(&deployment_name).acquire_owned().await.context("WASM semaphore closed")?;
                     let (tx, outcome) = self
                         .execute_wasm_udf(
@@ -477,11 +478,11 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     function_metadata.context("Missing function metadata for action")?;
                 let log_line_sender =
                     log_line_sender.context("Missing log line sender for action")?;
-                if self
-                    .module_environment(&mut transaction, path_and_args.path())
-                    .await?
-                    == ModuleEnvironment::Wasm
-                {
+                if is_wasm_environment(
+                    &self
+                        .module_environment(&mut transaction, path_and_args.path())
+                        .await?,
+                ) {
                     let _permit = self.wasm_runner.execution_semaphore_for_env(&deployment_name).acquire_owned().await.context("WASM semaphore closed")?;
                     let rng_seed = self.rt.rng().random();
                     let unix_timestamp = self.rt.unix_timestamp();
@@ -644,7 +645,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
             );
         };
         anyhow::ensure!(
-            metadata.environment == ModuleEnvironment::Wasm,
+            is_wasm_environment(&metadata.environment),
             "Trying to execute {:?} as a WASM module, but it is bundled for {:?}",
             path.udf_path,
             metadata.environment,
@@ -854,7 +855,7 @@ mod tests {
     use super::*;
 
     fn is_wasm_only_env(envs: &[ModuleEnvironment]) -> bool {
-        !envs.is_empty() && envs.iter().all(|e| *e == ModuleEnvironment::Wasm)
+        !envs.is_empty() && envs.iter().all(is_wasm_environment)
     }
 
     #[test]

@@ -51,7 +51,8 @@ type ModuleEnvironment = "node" | "isolate" | "wasm";
 // WASM guest source extensions that compile to a `wasm` module.
 // These files are read as binary/source and stashed as base64 `wasm` bundles
 // alongside the normal JS bundles.
-export const WASM_GUEST_EXTENSIONS = [".rs", ".kt", ".go", ".cs", ".dart"] as const;
+// One-home: `crates/model/src/modules/language.rs:ALL_WASM_EXTENSIONS` owns mapping; this mirrors it.
+export const WASM_GUEST_EXTENSIONS = [".rs", ".kt", ".go", ".cs", ".dart", ".zig", ".c"] as const;
 export const WASM_GUEST_EXT_SET = new Set<string>(WASM_GUEST_EXTENSIONS as readonly string[]);
 
 export function isWasmGuestPath(p: string): boolean {
