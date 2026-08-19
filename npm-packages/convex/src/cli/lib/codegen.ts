@@ -47,10 +47,12 @@ import {
 } from "../codegen_templates/component_api.js";
 import { functionsDir } from "./utils/utils.js";
 import { LargeIndexDeletionCheck } from "./indexes.js";
-import { kotlinCodegen } from "../codegen_templates/kotlin.js";
-import { rustCodegen } from "../codegen_templates/rust.js";
-import { csharpCodegen } from "../codegen_templates/csharp.js";
-import { dartCodegen } from "../codegen_templates/dart.js";
+import {
+  CODEGEN_DISPATCH,
+  normalizeLang,
+} from "./codegenLang.js";
+import type { CodegenLang } from "./codegenLang.js";
+export type { CodegenLang } from "./codegenLang.js";
 
 const PRESERVED_GENERATED_ENTRIES = new Set(["ai"]);
 
@@ -74,12 +76,7 @@ export function cleanupStaleGeneratedEntries(
   }
 }
 
-export type CodegenLang =
-  | "typescript"
-  | "kotlin"
-  | "rust"
-  | "csharp"
-  | "dart";
+/* CodegenLang is now single-sourced in ./codegenLang.js — see CODEGEN_DISPATCH */
 
 export type CodegenOptions = {
   url?: string | undefined;
@@ -511,54 +508,23 @@ export async function doFinalComponentCodegen(
   // FilterApi public/internal partition and componentPath addressing per
   // target via the template's FunctionReference(..., componentPath).
   const rawLang = opts?.lang ?? "typescript";
-  const lang: CodegenLang = ((rawLang as string) === "cs" ? "csharp" : rawLang) as CodegenLang;
+  const lang = normalizeLang(rawLang as string);
   if (lang !== "typescript") {
-    let outPath: string;
-    let contents: string;
-    switch (lang) {
-      case "kotlin":
-        outPath = path.join(codegenDir, "Api.kt");
-        contents = await kotlinCodegen(
-          ctx,
-          startPushResponse,
-          rootComponent,
-          componentDirectory,
-        );
-        break;
-      case "rust":
-        outPath = path.join(codegenDir, "api.rs");
-        contents = await rustCodegen(
-          ctx,
-          startPushResponse,
-          rootComponent,
-          componentDirectory,
-        );
-        break;
-      case "csharp":
-        outPath = path.join(codegenDir, "Api.cs");
-        contents = await csharpCodegen(
-          ctx,
-          startPushResponse,
-          rootComponent,
-          componentDirectory,
-        );
-        break;
-      case "dart":
-        outPath = path.join(codegenDir, "api.dart");
-        contents = await dartCodegen(
-          ctx,
-          startPushResponse,
-          rootComponent,
-          componentDirectory,
-        );
-        break;
-      default:
-        return await ctx.crash({
-          exitCode: 1,
-          errorType: "invalid filesystem data",
-          printedMessage: `Unknown --lang ${lang}. Supported: typescript, kotlin, rust, csharp, dart`,
-        });
+    const dispatch = (CODEGEN_DISPATCH as Record<string, { outputFile: string; gen: any }>)[lang];
+    if (!dispatch) {
+      return await ctx.crash({
+        exitCode: 1,
+        errorType: "invalid filesystem data",
+        printedMessage: `Unknown --lang ${lang}. Supported: typescript, kotlin, rust, csharp, dart`,
+      });
     }
+    const outPath = path.join(codegenDir, dispatch.outputFile);
+    const contents = await dispatch.gen(
+      ctx,
+      startPushResponse,
+      rootComponent,
+      componentDirectory,
+    );
     // Write raw (no prettier) — these languages have their own formatters
     if (opts?.debug) {
       logOutput(`# ${path.resolve(outPath)}`);

@@ -230,7 +230,7 @@ async function startComponentsPushAndCodegen(
     debugNodeApis: boolean;
     largeIndexDeletionCheck: LargeIndexDeletionCheck;
     codegenOnlyThisComponent?: string | undefined;
-    lang?: import("../lib/codegen.js").CodegenLang;
+    lang?: import("./codegenLang.js").CodegenLang;
   },
 ): Promise<StartPushResponse | null> {
   const convexDir = await getFunctionsDirectoryPath(ctx);

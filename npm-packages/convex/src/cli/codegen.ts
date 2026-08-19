@@ -7,6 +7,10 @@ import {
   loadSelectedDeploymentCredentials,
 } from "./lib/api.js";
 import { withRunningBackend } from "./lib/localDeployment/run.js";
+import {
+  CODEGEN_LANG_CHOICES,
+  normalizeLang,
+} from "./lib/codegenLang.js";
 export const codegen = new Command("codegen")
   .summary("Generate backend type definitions")
   .description(
@@ -57,7 +61,7 @@ export const codegen = new Command("codegen")
       "--lang <lang>",
       "Target language for generated client API (default: typescript).",
     )
-      .choices(["typescript", "kotlin", "rust", "csharp", "cs", "dart"] as const)
+      .choices(CODEGEN_LANG_CHOICES)
       .default("typescript" as const),
   )
   .action(async (options) => {
@@ -65,7 +69,7 @@ export const codegen = new Command("codegen")
     const deploymentSelection = await getDeploymentSelection(ctx, options);
 
     const rawLang = (options as any).lang ?? "typescript";
-    const normalizedLang = rawLang === "cs" ? "csharp" : rawLang;
+    const normalizedLang = normalizeLang(rawLang);
     const codegenOptions = {
       dryRun: !!options.dryRun,
       debug: !!options.debug,
