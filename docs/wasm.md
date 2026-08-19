@@ -11,6 +11,44 @@ The function runner supports two JS-engine modes, selected by `ISOLATE_EXECUTION
 
 Fuzz-related V8 flags passed via `ISOLATE_V8_FLAGS` (`--jit-fuzzing`, `--experimental-fuzzing`, `--randomize-hashes`) are dropped because they break UDF determinism; `V8_ALLOW_FUZZING_FLAGS=true` keeps them for local runtime fuzzing.
 
+## Composing polyglot functions in one deployment
+
+One deployment mixes `convex/messages.ts` (TypeScript), `convex/ingest.rs` (Rust), `convex/analytics.kt` (Kotlin) in one `convex/` dir. The deploy merges every `convex/*` module by `CanonicalizedModulePath` into one `ApiSurface`; clients use one `api`/`fullApi` regardless of backend language.
+
+Directory layout:
+
+```
+convex/
+  messages.ts   // TypeScript query
+  ingest.rs     // Rust guest
+  analytics.kt  // Kotlin guest
+convex/_generated/api.ts  // txt generated — do not edit
+```
+
+Build — TypeScript is bundled; wasm guests compile before deploy:
+
+- Rust: `cargo build --target wasm32-wasip1`
+- Go: `GOOS=wasip1 GOARCH=wasm go build`
+- Zig: `zig build-exe -target wasm32-wasi -mexec-model=reactor`
+- C/C++: `clang --target=wasm32-wasip1 -nostdlib`
+- Kotlin: `gradle wasmWasi`
+
+All become `wasm` modules in the same package; no per-language deployment.
+
+Runtime — `anyApi` is a Proxy that builds `FunctionReference` strings on property access (`npm-packages/convex/src/server/api.ts:431` `createApi`); the generated `api` is typed via `ApiFromModules` (`npm-packages/convex/src/server/api.ts:255`) mapping module paths to functions. Adding `convex/search.rs` makes `api.search.*` appear alongside `api.messages.*` in `fullApi`.
+
+Example client call:
+
+```
+import { api } from "./convex/_generated/api";
+await client.query(api.messages.list, {});
+await client.query(api.search.query, { q: "hello" });
+```
+
+Language status and toolchains are in the Language support table below; full candidate matrix lives in [non-js-languages.md](non-js-languages.md).
+
+Invariant: one `convex/` dir, one deployment, one `api`; extension selects toolchain.
+
 ## Runtime architecture
 
 ```

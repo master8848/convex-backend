@@ -59,3 +59,7 @@ The scaffold is the fastest way to get a conforming guest: it pre-wires the
   templates and `constexpr` that compile with `-nostdlib`.
 - `dart/`, `kotlin/` — status + plan (see `docs/wasm.md`); scaffolds land with
   the WasmGC / `wasmWasi` work.
+
+## Polyglot: add a Rust query in convex/search.rs
+
+Mix languages in one `convex/` dir: add a Rust query in convex/search.rs next to `convex/messages.ts` and run `cargo build --target wasm32-wasip1` for the Rust guest. Both modules deploy as one `ApiSurface`; `convex/_generated/api.ts` is txt generated api.ts — do not edit — and `api.search.*` appears alongside `api.messages.*` via `anyApi` Proxy (`npm-packages/convex/src/server/api.ts:431`) and `ApiFromModules` (`npm-packages/convex/src/server/api.ts:255`).

@@ -14,11 +14,9 @@ Status of every candidate guest language against the Convex WASM ABI (wasm32-was
 | Dart | 🚧 partially (upstream gates) | `--standalone` in 3.13 beta; legacy EH blocks wasmtime | wasm-opt `--translate-to-exnref` workaround; see [dart-guest.md](dart-guest.md) and [dart-feasibility-2026.md](dart-feasibility-2026.md) |
 | **Javy (JS-in-wasm)** | ⚠️ ABI-blocked | WASI p1 + `_start`, custom exports kebab-case only | WIT forbids `_` in export names; return values dropped; needs custom plugin |
 | **Python (CPython WASI)** | 🚧 not guest-ready | command-only: `memory` + `_start` only | 29 MB; custom guest = rebuild CPython with wasi-sdk (heavy) |
-| AssemblyScript | not evaluated in depth | — | — |
-| C#/.NET, Java/TeaVM, Ruby, PHP, Swift | not evaluated in depth | — | — |
+| AssemblyScript, C#/.NET, Java/TeaVM, Ruby, PHP, Swift | not evaluated in depth | — | — |
 | **Cross-language clients** | design adopted — validator JSON IR, per-target emitters for TS/Kotlin/Rust/C#/Dart; mixed backend merges into one `ApiSurface` | `ApiSurface` = `Vec<AnalyzedFunction>` by `CanonicalizedModulePath` | See [polyglot backend note](../.agents/notes/implemented/architecture/2026-08-19-polyglot-backend-and-client-generation.md) |
 | **Internal tracking transport** | WS primary, SSE optional fallback; tracking is `ReadSet`→`IntervalMap`→`Transition` | `Token`/`IntervalMap` + `ServerMessage::Transition` (`TransitionChunk` at 5 MB) | See [internal tracking note](../.agents/notes/implemented/architecture/2026-08-19-internal-tracking-and-event-transport.md) |
-
 ## Verified findings
 
 ### Zig
