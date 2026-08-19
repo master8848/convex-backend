@@ -22,6 +22,10 @@ server. Lower this to protect memory under load spikes; raise it for
 throughput-bound workloads. Passed through in the
 [`docker-compose.yml`](../docker/docker-compose.yml) `env` section.
 
+## `ISOLATE_EXECUTION_ENABLED` (wasm-only deployments)
+
+`ISOLATE_EXECUTION_ENABLED` (default `true`) selects the JS-engine mode for the function runner. Set `ISOLATE_EXECUTION_ENABLED=false` (or the local backend's `--disable-js-engine` / `DISABLE_JS_ENGINE=true`) for wasm-only deployments: the backend skips eager V8 initialization (no ICU data load, no UDF snapshot, no V8 platform threads, no worker isolates), saving hundreds of MB of process RAM. In this mode `FunctionRunnerCore` is constructed with `isolate_client: None` (`crates/function_runner/src/server.rs:260`); any request that needs the JS engine (TypeScript functions, `analyze`, `evaluate_app_definitions`, `evaluate_schema`, `evaluate_auth_config`, HTTP actions) fails fast with `JavaScriptExecutionDisabled` (`crates/function_runner/src/server.rs:840`) instead of loading V8 on demand. Only `wasm` modules (`common::types::ModuleEnvironment::Wasm`, `model::modules::types::ModuleMetadata.environment`) can run. See [wasm deployment modes](../../docs/wasm.md#deployment-modes) and `crates/common/src/knobs.rs:949`.
+
 ## Security knobs
 
 The following environment variables control the security posture of a

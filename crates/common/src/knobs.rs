@@ -2031,3 +2031,22 @@ pub static HTTP2_CLIENT_KEEPALIVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|
 /// dropped.
 pub static HTTP2_CLIENT_KEEPALIVE_TIMEOUT: LazyLock<Duration> =
     LazyLock::new(|| Duration::from_secs(env_config("HTTP2_CLIENT_KEEPALIVE_TIMEOUT_SECONDS", 15)));
+
+/// Enable `permessage-deflate` extension for WebSocket sync connections.
+/// When true, the server will advertise `permessage-deflate` if the client
+/// offers it, enabling transparent compression of Transition payloads.
+/// Disable via `WS_PERMESSAGE_DEFLATE=false` to allow A/B measurement of
+/// payload size vs CPU cost. See `crates/common/src/http/websocket.rs`.
+pub static WS_PERMESSAGE_DEFLATE: LazyLock<bool> =
+    LazyLock::new(|| env_config("WS_PERMESSAGE_DEFLATE", true));
+
+/// Enable SSE fallback transport for sync (`GET /api/sse_sync`).
+/// When false, the `sse` route returns 404. Gated so SSE can be rolled out
+/// independently of the primary WebSocket path.
+pub static SSE_SYNC_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| env_config("SSE_SYNC_ENABLED", true));
+
+/// Maximum size of a single sync message before splitting into TransitionChunks.
+/// Kept here so WS and SSE share the same bound (5 MiB default).
+pub static SYNC_MAX_MESSAGE_SIZE: LazyLock<usize> =
+    LazyLock::new(|| env_config("SYNC_MAX_MESSAGE_SIZE", 5_000_000));

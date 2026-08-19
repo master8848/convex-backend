@@ -4,6 +4,7 @@
 #![feature(try_blocks_heterogeneous)]
 
 mod metrics;
+pub mod patch;
 mod state;
 pub mod subscription_reconnect;
 pub mod worker;

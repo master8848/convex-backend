@@ -3,7 +3,6 @@
 
 use std::{
     collections::{
-        hash_map::DefaultHasher,
         BTreeMap,
         HashMap,
     },
@@ -413,8 +412,15 @@ impl SharedSubscriptionEntry {
 
 /// A digest of a read set for deduplication. Not cryptographic; equal read
 /// sets hash equally because iteration order is deterministic.
+///
+/// Uses `fxhash::FxHasher` (deterministic, ~2× faster than `SipHasher13`
+/// behind `DefaultHasher`) because the digest is only used as a best-effort
+/// dedup key within a single process. Collisions are benign (missed dedup),
+/// and determinism across calls is required for the `(digest,ts,system)`
+/// map. `ahash` would also be viable; `FxHasher` was chosen for its
+/// zero-seed determinism.
 fn reads_digest(reads: &ReadSet) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = fxhash::FxHasher::default();
     for (index, index_reads) in reads.iter_indexed() {
         index.hash(&mut hasher);
         index_reads.fields.hash(&mut hasher);

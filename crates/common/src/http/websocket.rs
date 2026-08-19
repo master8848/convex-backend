@@ -74,7 +74,10 @@ use tokio_tungstenite::{
     WebSocketStream,
 };
 
-use crate::http::HttpResponseError;
+use crate::{
+    http::HttpResponseError,
+    knobs::WS_PERMESSAGE_DEFLATE,
+};
 
 #[must_use]
 pub struct WebSocketUpgrade<F = DefaultOnFailedUpgrade> {
@@ -203,7 +206,7 @@ impl<F> WebSocketUpgrade<F> {
             };
             let upgraded = TokioIo::new(upgraded);
 
-            if client_offers_deflate {
+            if client_offers_deflate && *WS_PERMESSAGE_DEFLATE {
                 config.extensions.permessage_deflate = Some(DeflateConfig::default());
             }
 
@@ -242,8 +245,8 @@ impl<F> WebSocketUpgrade<F> {
                 .headers_mut()
                 .insert(header::SEC_WEBSOCKET_PROTOCOL, protocol);
         }
-        // Convex fork: if the client offered permessage-deflate, advertise support.
-        if self.client_offers_deflate {
+        // Convex fork: if the client offered permessage-deflate and knob allows it, advertise support.
+        if self.client_offers_deflate && *WS_PERMESSAGE_DEFLATE {
             response.headers_mut().insert(
                 HeaderName::from_static("sec-websocket-extensions"),
                 HeaderValue::from_static("permessage-deflate"),

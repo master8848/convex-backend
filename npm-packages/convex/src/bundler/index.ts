@@ -46,7 +46,28 @@ export function* walkDir(
 }
 
 // Convex specific module environment.
-type ModuleEnvironment = "node" | "isolate";
+type ModuleEnvironment = "node" | "isolate" | "wasm";
+
+// WASM guest source extensions that compile to a `wasm` module.
+// These files are read as binary/source and stashed as base64 `wasm` bundles
+// alongside the normal JS bundles.
+export const WASM_GUEST_EXTENSIONS = [".rs", ".kt", ".go", ".cs", ".dart"] as const;
+export const WASM_GUEST_EXT_SET = new Set<string>(WASM_GUEST_EXTENSIONS as readonly string[]);
+
+export function isWasmGuestPath(p: string): boolean {
+  const ext = path.extname(p).toLowerCase();
+  return WASM_GUEST_EXT_SET.has(ext);
+}
+
+export function wasmGuestModulePath(relPath: string): string {
+  // Map e.g. "ingest.rs" or "analytics.kt" -> "ingest.js" / "analytics.js"
+  // so `CanonicalizedModulePath` (which requires `.js`) and `importPath`
+  // (`../ingest.js`) stay uniform across TS and wasm modules.
+  const parsed = path.parse(relPath);
+  const dir = parsed.dir ? `${parsed.dir}/` : "";
+  const base = parsed.name;
+  return `${dir}${base}.js`.split(path.sep).join(path.posix.sep);
+}
 
 export interface Bundle {
   path: string;
@@ -449,8 +470,12 @@ export async function entryPoints(
       );
     }
 
-    // This should match isEntryPoint in the convex eslint plugin.
-    if (!ENTRY_POINT_EXTENSIONS.some((ext) => relPath.endsWith(ext))) {
+    // WASM guest files are polyglot entry points that compile to `.wasm`
+    // and are stashed as `ModuleConfig { path: "*.js", environment: "wasm", source: base64(wasm) }`.
+    const extLower = extension.toLowerCase();
+    const isWasmGuest = WASM_GUEST_EXT_SET.has(extLower);
+    const isJsEntry = ENTRY_POINT_EXTENSIONS.some((ext) => relPath.endsWith(ext));
+    if (!isJsEntry && !isWasmGuest) {
       logVerbose(chalkStderr.yellow(`Skipping non-JS file ${fpath}`));
     } else if (relPath.startsWith("_generated" + path.sep)) {
       logVerbose(chalkStderr.yellow(`Skipping ${fpath}`));
@@ -479,6 +504,9 @@ export async function entryPoints(
   // If using TypeScript, require that at least one line starts with `export` or `import`,
   // a TypeScript requirement. This prevents confusing type errors from empty .ts files.
   const nonEmptyEntryPoints = entryPoints.filter((fpath) => {
+    if (isWasmGuestPath(fpath)) {
+      return true;
+    }
     // This check only makes sense for TypeScript files
     if (!fpath.endsWith(".ts") && !fpath.endsWith(".tsx")) {
       return true;
@@ -555,6 +583,9 @@ async function determineEnvironment(
   dir: string,
   fpath: string,
 ): Promise<ModuleEnvironment> {
+  if (isWasmGuestPath(fpath)) {
+    return "wasm";
+  }
   const relPath = path.relative(dir, fpath);
 
   const useNodeDirectiveFound = hasUseNodeDirective(ctx, fpath);
@@ -582,16 +613,60 @@ async function determineEnvironment(
 }
 
 export async function entryPointsByEnvironment(ctx: Context, dir: string) {
-  const isolate = [];
-  const node = [];
+  const isolate: string[] = [];
+  const node: string[] = [];
+  const wasm: string[] = [];
   for (const entryPoint of await entryPoints(ctx, dir)) {
     const environment = await determineEnvironment(ctx, dir, entryPoint);
     if (environment === "node") {
       node.push(entryPoint);
+    } else if (environment === "wasm") {
+      wasm.push(entryPoint);
     } else {
       isolate.push(entryPoint);
     }
   }
 
-  return { isolate, node };
+  return { isolate, node, wasm };
+}
+
+/**
+ * Build `Bundle`s for wasm guest files.
+ * For this incremental stage we do not invoke heavy toolchains; we read the
+ * guest source and base64-encode it. If a prebuilt `<name>.wasm` sidecar exists
+ * beside the source file we prefer its bytes. The resulting `Bundle.path` is
+ * the canonical `*.js` logical path so `apiCodegen` and `CanonicalizedModulePath`
+ * remain uniform.
+ */
+export async function bundleWasmGuests(
+  ctx: Context,
+  dir: string,
+  wasmEntryPoints: string[],
+): Promise<Bundle[]> {
+  const bundles: Bundle[] = [];
+  for (const fpath of wasmEntryPoints) {
+    const relPath = path.relative(dir, fpath);
+    const logicalPath = wasmGuestModulePath(relPath);
+    // Prefer a prebuilt .wasm sibling if present: e.g. ingest.rs -> ingest.wasm
+    const parsed = path.parse(fpath);
+    const wasmSidecar = path.join(parsed.dir, `${parsed.name}.wasm`);
+    let bytes: Buffer;
+    let sourceMap: string | undefined;
+    if (ctx.fs.exists(wasmSidecar)) {
+      // Binary wasm sidecar: read raw bytes. `readUtf8File` would corrupt, so use stat/read via fs if available.
+      try {
+        const raw = (ctx.fs as any).readFile?.(wasmSidecar) ?? ctx.fs.readUtf8File(wasmSidecar);
+        bytes = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as string, "utf-8");
+      } catch {
+        const text = ctx.fs.readUtf8File(fpath);
+        bytes = Buffer.from(text, "utf-8");
+      }
+    } else {
+      const text = ctx.fs.readUtf8File(fpath);
+      bytes = Buffer.from(text, "utf-8");
+    }
+    const source = bytes.toString("base64");
+    bundles.push({ path: logicalPath, source, environment: "wasm" });
+  }
+  return bundles;
 }

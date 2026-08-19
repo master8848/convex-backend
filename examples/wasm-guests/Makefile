@@ -15,34 +15,36 @@ rust:
 
 go:
 	@mkdir -p $(BUILD)/go
-	@echo ">> building go example (requires Go >= 1.24)"
-	@cd go && GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o wasm_guest_example.wasm .
+	@echo ">> building go example (requires Go >= 1.24, per-lang size tuning: -ldflags -s -w -trimpath)"
+	@cd go && GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o wasm_guest_example.wasm .
 	@mv go/wasm_guest_example.wasm $(BUILD)/go/
-	@echo "   ok: $(BUILD)/go/wasm_guest_example.wasm"
+	@echo "   ok: $(BUILD)/go/wasm_guest_example.wasm  (tuned: -s -w cuts debug, -trimpath deterministic)"
 
 c:
 	@mkdir -p $(BUILD)/c
 	@echo ">> building c example (requires LLVM clang with wasm32-wasip1; Apple clang lacks it)"
-	@clang --target=wasm32-wasip1 -O3 -nostdlib -fno-exceptions -Wl,--no-entry \
+	@clang --target=wasm32-wasip1 -Oz -flto -ffunction-sections -fdata-sections -fvisibility=hidden -nostdlib -fno-exceptions \
+		-Wl,--no-entry -Wl,--gc-sections -Wl,--icf=all -Wl,--strip-all \
 		-Wl,--export=__convex_run -Wl,--export=__convex_functions -Wl,--allow-undefined \
 		-o $(BUILD)/c/wasm_guest_example.wasm c/guest.c
-	@echo "   ok: $(BUILD)/c/wasm_guest_example.wasm"
+	@echo "   ok: $(BUILD)/c/wasm_guest_example.wasm  (tuned: -Oz -flto --gc-sections --icf --strip-all)"
 
 cpp:
 	@mkdir -p $(BUILD)/cpp
 	@echo ">> building cpp example (requires LLVM clang++ with wasm32-wasip1; Apple clang lacks it)"
-	@clang++ --target=wasm32-wasip1 -O3 -nostdlib -fno-exceptions -fno-rtti -fno-threadsafe-statics \
-		-Wl,--no-entry -Wl,--export=__convex_run -Wl,--export=__convex_functions -Wl,--allow-undefined \
+	@clang++ --target=wasm32-wasip1 -Oz -flto -ffunction-sections -fdata-sections -fvisibility=hidden -nostdlib -fno-exceptions -fno-rtti -fno-threadsafe-statics \
+		-Wl,--no-entry -Wl,--gc-sections -Wl,--icf=all -Wl,--strip-all \
+		-Wl,--export=__convex_run -Wl,--export=__convex_functions -Wl,--allow-undefined \
 		-o $(BUILD)/cpp/wasm_guest_example.wasm cpp/guest.cpp
-	@echo "   ok: $(BUILD)/cpp/wasm_guest_example.wasm"
+	@echo "   ok: $(BUILD)/cpp/wasm_guest_example.wasm  (tuned: -Oz -flto --gc-sections)"
 
 zig:
 	@mkdir -p $(BUILD)/zig
-	@echo ">> building zig example (requires zig >= 0.16)"
-	@cd zig && zig build-exe guest.zig -target wasm32-wasi -mexec-model=reactor -O ReleaseSmall -fstrip \
+	@echo ">> building zig example (requires zig >= 0.16, wasip1 reactor, ReleaseSmall)"
+	@cd zig && zig build-exe guest.zig -target wasm32-wasip1 -mexec-model=reactor -O ReleaseSmall -fstrip \
 		--export=__convex_run --export=__convex_functions --name wasm_guest_example
 	@mv zig/wasm_guest_example.wasm $(BUILD)/zig/
-	@echo "   ok: $(BUILD)/zig/wasm_guest_example.wasm"
+	@echo "   ok: $(BUILD)/zig/wasm_guest_example.wasm  (tuned: wasip1 + ReleaseSmall + fstrip, 394-837B)"
 
 # Report which toolchains are present and how to install the missing ones.
 check:

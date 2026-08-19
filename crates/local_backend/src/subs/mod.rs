@@ -350,7 +350,7 @@ async fn run_sync_socket(
     log_websocket_closed(partition_id_label.clone());
 }
 
-fn new_sync_worker_config(
+pub(crate) fn new_sync_worker_config(
     client_version: ClientVersion,
     subscription_reconnect_rate_limiter: Option<Arc<SubscriptionReconnectRateLimiter>>,
 ) -> anyhow::Result<SyncWorkerConfig> {
@@ -370,46 +370,34 @@ fn new_sync_worker_config(
     })
 }
 
-// Maximum size of a single message before splitting into chunks (5MB)
-const MAX_MESSAGE_SIZE: usize = 5_000_000;
+#[cfg(feature = "sse")]
+pub mod sse;
 
-/// Split a large Transition message into TransitionChunk messages if needed.
-fn maybe_split_transition(
-    message: ServerMessage,
-    supports_chunks: bool,
-) -> anyhow::Result<Vec<ServerMessage>> {
-    if !supports_chunks {
-        return Ok(vec![message]);
-    }
+/// Maximum size of a single message before splitting into chunks (5MB).
+/// Shared by WS and SSE; overridden via `SYNC_MAX_MESSAGE_SIZE` knob.
+pub const MAX_MESSAGE_SIZE: usize = 5_000_000;
 
-    let transition = match message {
-        ServerMessage::Transition { .. } => message,
-        other => return Ok(vec![other]),
-    };
-
-    // heap_size is just a (low) estimate of the serialized size
-    if transition.heap_size() <= MAX_MESSAGE_SIZE {
-        return Ok(vec![transition]);
-    }
-
-    let transition_json = serde_json::to_string(&JsonValue::from(transition))?;
-
-    // Careful with UTF-8, use valid boundaries
+/// Shared helper: split a serialized Transition into TransitionChunk messages.
+/// WS (`run_sync_socket`) and SSE (`sse::sse_sync`) both call this so chunk
+/// boundaries and `transition_id` semantics stay identical. No duplicate
+/// transition logic; `sync_types::ServerMessage` remains the one wire format.
+pub fn split_transition_into_chunks(
+    transition_json: String,
+    max_message_size: usize,
+) -> Vec<ServerMessage> {
     let mut chunks = Vec::new();
     let mut start = 0;
     while start < transition_json.len() {
-        let mut end = (start + MAX_MESSAGE_SIZE).min(transition_json.len());
+        let mut end = (start + max_message_size).min(transition_json.len());
         while end > start && !transition_json.is_char_boundary(end) {
             end -= 1;
         }
         chunks.push(transition_json[start..end].to_string());
         start = end;
     }
-
     let total_parts = chunks.len() as u32;
     let transition_id = transition_json.len().to_string();
-
-    Ok(chunks
+    chunks
         .into_iter()
         .enumerate()
         .map(|(idx, chunk)| ServerMessage::TransitionChunk {
@@ -418,7 +406,41 @@ fn maybe_split_transition(
             total_parts,
             transition_id: transition_id.clone(),
         })
-        .collect())
+        .collect()
+}
+
+/// Shared entry-point reused by WS and SSE. Returns `Vec<ServerMessage>` of
+/// length 1 for non-Transition or small messages, or N `TransitionChunk`s when
+/// chunking is required.
+pub fn maybe_split_transition(
+    message: ServerMessage,
+    supports_chunks: bool,
+) -> anyhow::Result<Vec<ServerMessage>> {
+    maybe_split_transition_with_limit(message, supports_chunks, MAX_MESSAGE_SIZE)
+}
+
+/// `maybe_split_transition` with explicit limit, used by tests and SSE when
+/// the knob overrides `MAX_MESSAGE_SIZE`.
+pub fn maybe_split_transition_with_limit(
+    message: ServerMessage,
+    supports_chunks: bool,
+    max_message_size: usize,
+) -> anyhow::Result<Vec<ServerMessage>> {
+    if !supports_chunks {
+        return Ok(vec![message]);
+    }
+    let transition = match message {
+        ServerMessage::Transition { .. } => message,
+        other => return Ok(vec![other]),
+    };
+    if transition.heap_size() <= max_message_size {
+        return Ok(vec![transition]);
+    }
+    let transition_json = serde_json::to_string(&JsonValue::from(transition))?;
+    Ok(split_transition_into_chunks(
+        transition_json,
+        max_message_size,
+    ))
 }
 
 pub async fn sync_handler(

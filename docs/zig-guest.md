@@ -16,10 +16,12 @@ exports: memory, __convex_functions, _initialize, __convex_run
 ## Build
 
 ```sh
-zig build-exe guest.zig -target wasm32-wasi -mexec-model=reactor \
+zig build-exe guest.zig -target wasm32-wasip1 -mexec-model=reactor \
   -O ReleaseSmall -fstrip \
   --export=__convex_run --export=__convex_functions --name guest
 ```
+
+Per-lang tuning: `wasm32-wasip1` (not legacy `wasm32-wasi`) keeps the engine's `wasmtime 47` `wasm32-wasip1` contract (`crates/wasm_runner/src/engine.rs:105`); `ReleaseSmall` + `fstrip` + `--export=` are the size minima (394 B echo / 837 B with arg parsing). `ReleaseSmall` vs `ReleaseSafe` saves ~200 B; `fstrip` saves ~1 KiB of debug names; no `ReleaseFast` — it adds unrolling. Keep imports to 4 `env` functions for the smallest module; adding `std.debug.print` would pull `wasi_snapshot_preview1.fd_write` and 2-4 KiB.
 
 Requires Zig 0.16+ (https://ziglang.org/download/). The e2e test (`crates/wasm_runner/tests/zig_guest_e2e.rs`) probes `zig version` and skips cleanly when the toolchain is absent, like the other guest tests.
 

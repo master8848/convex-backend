@@ -49,7 +49,10 @@ use sync_types::{
     StateVersion,
 };
 
-use crate::metrics;
+use crate::{
+    metrics,
+    patch::maybe_patch,
+};
 
 type ValueDigest = Sha256Digest;
 type ErrorDigest = Sha256Digest;
@@ -81,6 +84,12 @@ pub struct SyncedQuery {
     /// - `Some(..) -> Some(..)`: `SyncState::complete_fetch`, after the first
     ///   time.
     result_hash: Option<Result<ValueDigest, ErrorDigest>>,
+
+    /// Last successful packed value for delta encoding. When a query is
+    /// re-executed and the new value differs only slightly, we can send a
+    /// RFC6902 JSON-Patch instead of the full value, gated by the
+    /// `maybe_patch` heuristic (size >1KB, patch <70% of full).
+    last_value: Option<JsonPackedValue>,
 
     /// Handle to the query's current invalidation future. This future completes
     /// when `self.subscription` is no longer valid and the query should be
@@ -424,6 +433,7 @@ impl SyncState {
                 query,
                 subscription: None,
                 result_hash: None,
+                last_value: None,
                 invalidation_future: None,
             };
             if self.queries.insert(query_id, sq).is_some() {
@@ -462,14 +472,38 @@ impl SyncState {
             None
         } else {
             let modification = match result {
-                Ok(value) => StateModification::QueryUpdated {
-                    query_id,
-                    value,
-                    log_lines: log_lines.into(),
-                    journal,
+                Ok(value) => {
+                    // Try delta encoding: if we have a previous value and the
+                    // new one is large, generate an RFC6902 patch. Patch is
+                    // language-agnostic (operates on packed JSON) and falls
+                    // back to full value when patch would be >70% of full.
+                    let patch_opt = query
+                        .last_value
+                        .as_ref()
+                        .and_then(|old| maybe_patch(old, &value));
+                    let modification = if let Some(patch) = patch_opt {
+                        StateModification::QueryPatched {
+                            query_id,
+                            patch,
+                            log_lines: log_lines.into(),
+                            journal: journal.clone(),
+                        }
+                    } else {
+                        StateModification::QueryUpdated {
+                            query_id,
+                            value: value.clone(),
+                            log_lines: log_lines.into(),
+                            journal: journal.clone(),
+                        }
+                    };
+                    // Remember for next delta
+                    query.last_value = Some(value);
+                    modification
                 },
                 Err(error) => {
                     metrics::log_query_failed(self.partition_id);
+                    // On failure, clear last_value so next success sends full
+                    query.last_value = None;
                     StateModification::QueryFailed {
                         query_id,
                         error_message: error.to_string(),

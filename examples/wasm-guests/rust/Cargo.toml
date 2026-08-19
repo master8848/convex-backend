@@ -19,5 +19,9 @@ serde_json = "1"
 [profile.release]
 opt-level = "s"
 lto = true
+codegen-units = 1
 strip = "symbols"
 panic = "abort"
+# Extra size wins: no debug, no incremental, single codegen unit already set.
+debug = false
+incremental = false

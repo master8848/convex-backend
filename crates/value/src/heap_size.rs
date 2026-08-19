@@ -963,6 +963,16 @@ impl<V: HeapSize> HeapSize for StateModification<V> {
                 log_lines,
                 journal,
             } => value.heap_size() + log_lines.heap_size() + journal.heap_size(),
+            StateModification::QueryPatched {
+                query_id: _,
+                patch,
+                log_lines,
+                journal,
+            } => serde_json::to_string(patch)
+                .map(|s| s.heap_size())
+                .unwrap_or(0)
+                + log_lines.heap_size()
+                + journal.heap_size(),
             StateModification::QueryFailed {
                 query_id: _,
                 error_message,

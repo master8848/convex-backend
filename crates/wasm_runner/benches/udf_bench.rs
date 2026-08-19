@@ -79,7 +79,15 @@ fn build_rust_guest() -> anyhow::Result<(Vec<u8>, WasmFunctionDescriptor)> {
 fn build_go_guest() -> anyhow::Result<Option<(Vec<u8>, WasmFunctionDescriptor)>> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/go_guest",);
     let output = std::process::Command::new("go")
-        .args(["build", "-buildmode=c-shared", "-o", "go_guest.wasm", "."])
+        .args([
+            "build",
+            "-buildmode=c-shared",
+            "-ldflags=-s -w",
+            "-trimpath",
+            "-o",
+            "go_guest.wasm",
+            ".",
+        ])
         .current_dir(dir)
         .env("GOOS", "wasip1")
         .env("GOARCH", "wasm")

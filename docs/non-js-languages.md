@@ -1,6 +1,6 @@
 # Non-JS guest languages for Convex WASM functions
 
-Status of every candidate guest language against the Convex WASM ABI (wasm32-wasip1 + wasmtime 47.0.3; a guest exports `__convex_run` / `__convex_functions`, imports the `env` host functions, uses host-allocated memory, and is a reactor). The ABI and runner behavior live in [wasm.md](wasm.md); the policy that each language ships with a fixture, e2e test, and example is recorded in [Agent Note 2026-08-11-guest-language-fixtures-and-examples](../.agents/notes/implemented/feature/2026-08-11-guest-language-fixtures-and-examples.md).
+Status of every candidate guest language against the Convex WASM ABI (wasm32-wasip1 + wasmtime 47.0.3; a guest exports `__convex_run` / `__convex_functions`, imports the `env` host functions, uses host-allocated memory, and is a reactor). The ABI and runner behavior live in [wasm.md](wasm.md); the policy that each language ships with a fixture, e2e test, and example is recorded in [Agent Note 2026-08-11-guest-language-fixtures-and-examples](../.agents/notes/implemented/feature/2026-08-11-guest-language-fixtures-and-examples.md). Per-language client+server testing matrix and codegen goldens: `/tmp/impl-testing-report.md`.
 
 ## Status matrix
 

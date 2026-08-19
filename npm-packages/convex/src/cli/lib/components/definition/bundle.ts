@@ -24,6 +24,7 @@ import {
   bundle,
   bundleAuthConfig,
   bundleSchema,
+  bundleWasmGuests,
   entryPointsByEnvironment,
 } from "../../../../bundler/index.js";
 import { NodeDependency } from "../../deployApi/modules.js";
@@ -693,7 +694,26 @@ export async function bundleImplementations({
         printedMessage: "external dependencies not supported",
       });
     }
-    const functions = convexResult.modules;
+    const functions: Bundle[] = [...convexResult.modules];
+    if (entryPoints.wasm.length > 0) {
+      const wasmBundles = await bundleWasmGuests(
+        ctx,
+        resolvedPath,
+        entryPoints.wasm,
+      );
+      const seen = new Set(functions.map((m) => m.path));
+      for (const m of wasmBundles) {
+        if (seen.has(m.path)) {
+          return await ctx.crash({
+            exitCode: 1,
+            errorType: "invalid filesystem data",
+            printedMessage: `Duplicate module path "${m.path}" — a JS and a WASM guest would both produce the same logical module. Rename one.`,
+          });
+        }
+        seen.add(m.path);
+      }
+      functions.push(...wasmBundles);
+    }
     if (isRoot) {
       if (verbose) {
         showSpinner("Bundling modules for Node.js runtime...");

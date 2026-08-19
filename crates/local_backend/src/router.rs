@@ -292,10 +292,16 @@ struct PublicApiDoc;
 struct DashboardApiDoc;
 
 pub fn router(st: LocalAppState) -> Router {
-    let browser_routes = Router::new()
+    #[allow(unused_mut)]
+    let mut browser_routes = Router::new()
         // Called by the browser (and optionally authenticated by a cookie or `Authorization`
         // header). Passes version in the URL because websockets can't do it in header.
         .route("/{client_version}/sync", get(sync));
+
+    #[cfg(feature = "sse")]
+    {
+        browser_routes = browser_routes.route("/sse_sync", get(crate::subs::sse::sse_sync));
+    }
 
     // routes are added by common_dashboard_routes below
     let (_, common_dashboard_openapi_spec) =
@@ -403,10 +409,17 @@ pub fn router(st: LocalAppState) -> Router {
         .split_for_parts();
     let public_openapi_spec = public_openapi.to_pretty_json().unwrap();
 
-    let migrated_api_routes = Router::new()
+    #[allow(unused_mut)]
+    let mut migrated_api_routes = Router::new()
         .merge(browser_routes)
         .merge(public_routes)
-        .route("/sync", get(sync))
+        .route("/sync", get(sync));
+    #[cfg(feature = "sse")]
+    {
+        migrated_api_routes =
+            migrated_api_routes.route("/sse_sync", get(crate::subs::sse::sse_sync));
+    }
+    let migrated_api_routes = migrated_api_routes
         .route(
             "/public_openapi.json",
             axum::routing::get({

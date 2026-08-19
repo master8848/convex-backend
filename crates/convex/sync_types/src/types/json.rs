@@ -494,6 +494,18 @@ impl<V: Into<JsonValue>> From<StateModification<V>> for JsonValue {
                     "journal": journal
                 })
             },
+            StateModification::QueryPatched {
+                query_id,
+                patch,
+                log_lines,
+                journal,
+            } => json!({
+                "type": "QueryPatched",
+                "queryId": query_id,
+                "patch": patch,
+                "logLines": log_lines,
+                "journal": journal
+            }),
             StateModification::QueryFailed {
                 query_id,
                 error_message,
@@ -538,6 +550,13 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for StateM
                 journal: SerializedQueryJournal,
             },
             #[serde(rename_all = "camelCase")]
+            QueryPatched {
+                query_id: QueryId,
+                patch: JsonValue,
+                log_lines: LogLinesMessage,
+                journal: SerializedQueryJournal,
+            },
+            #[serde(rename_all = "camelCase")]
             QueryFailed {
                 query_id: QueryId,
                 error_message: String,
@@ -559,6 +578,17 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for StateM
             } => StateModification::QueryUpdated {
                 query_id,
                 value: value.try_into()?,
+                log_lines,
+                journal,
+            },
+            StateModificationJson::QueryPatched {
+                query_id,
+                patch,
+                log_lines,
+                journal,
+            } => StateModification::QueryPatched {
+                query_id,
+                patch,
                 log_lines,
                 journal,
             },

@@ -69,10 +69,7 @@ use crate::{
         VirtualMonotonicClock,
         VirtualWallClock,
     },
-    limits::{
-        WasmLimits,
-        DEFAULT_MAX_MEMORY_BYTES,
-    },
+    limits::WasmLimits,
     validation::validate_module,
 };
 
@@ -82,6 +79,18 @@ const MAX_CACHED_MODULES: usize = 128;
 /// CPU-intensive, so concurrent compiles are limited to a small pool to avoid
 /// starving the runtime under a flood of unique modules.
 const MAX_CONCURRENT_COMPILES: usize = 2;
+/// The maximum concurrent executions per environment (deployment). This bounds
+/// per-env UDF concurrency so one env cannot starve others; the isolate path
+/// uses a similar per-env semaphore via `concurrency_limiter.rs`.
+const MAX_CONCURRENT_EXECUTIONS_PER_ENV: usize = 64;
+/// GC heap reservation tuned for Kotlin WasmGC (wasmtime 47 enables GC by
+/// default). The GC heap is separate from linear memory `StoreLimits`; capping
+/// it at 64 MiB reservation + 32 MiB growth avoids 256 MiB of virtual-memory
+/// reservation per store while still covering Kotlin `wasmWasi` modules (which
+/// rarely exceed tens of MB of GC heap). Freestanding C/Zig/Rust/Go guests
+/// allocate no GC heap, so this is pure saving.
+const GC_HEAP_RESERVATION_BYTES: u64 = 64 * 1024 * 1024;
+const GC_HEAP_GROWTH_BYTES: u64 = 32 * 1024 * 1024;
 /// The reactor initialization export used by Go guests.
 const INITIALIZE: &str = "_initialize";
 /// The maximum number of log lines captured per invocation, matching the
@@ -95,7 +104,9 @@ const MAX_LOG_LINES: usize = 256;
 pub struct WasmRunner {
     engine: Engine,
     module_cache: Mutex<HashMap<[u8; 32], Arc<Module>>>,
+    serialized_cache: Mutex<HashMap<[u8; 32], Vec<u8>>>,
     compile_semaphore: tokio::sync::Semaphore,
+    execution_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
 }
 
 impl WasmRunner {
@@ -109,19 +120,92 @@ impl WasmRunner {
             .cranelift_nan_canonicalization(true)
             // Disable relaxed SIMD, whose behavior is nondeterministic.
             .wasm_relaxed_simd(false)
+            // Explicitly enable WasmGC + function-references (wasmtime 47
+            // defaults them on, but pin them for determinism and for the
+            // Kotlin `wasmWasi` target which emits GC + exnref).
+            .wasm_gc(true)
+            .wasm_function_references(true)
             // CPU budget via fuel, with cooperative async yields.
             .consume_fuel(true)
             // WasmGC allocations (struct.new, array.new, ...) live in a GC
             // heap that StoreLimits::memory_size does not bound, so cap the
-            // GC heap reservation at the linear memory budget.
-            .gc_heap_reservation(DEFAULT_MAX_MEMORY_BYTES)
-            .gc_heap_reservation_for_growth(DEFAULT_MAX_MEMORY_BYTES);
+            // GC heap reservation separately. Tuned to 64 MiB + 32 MiB growth
+            // (down from 256 MiB) to reduce virtual-memory pressure per store
+            // while covering Kotlin WasmGC; freestanding C/Zig/Rust/Go guests
+            // allocate no GC heap.
+            .gc_heap_reservation(GC_HEAP_RESERVATION_BYTES)
+            .gc_heap_reservation_for_growth(GC_HEAP_GROWTH_BYTES);
         let engine = Engine::new(&config)?;
         Ok(Self {
             engine,
             module_cache: Mutex::new(HashMap::new()),
+            serialized_cache: Mutex::new(HashMap::new()),
             compile_semaphore: tokio::sync::Semaphore::new(MAX_CONCURRENT_COMPILES),
+            execution_semaphores: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Per-environment execution semaphore. Each deployment env gets its own
+    /// concurrency bound (`MAX_CONCURRENT_EXECUTIONS_PER_ENV`) so one noisy
+    /// env does not starve others. This mirrors the isolate path's per-env
+    /// limiting in `crates/isolate/src/concurrency_limiter.rs:109`.
+    pub fn execution_semaphore_for_env(&self, env: &str) -> Arc<tokio::sync::Semaphore> {
+        let mut map = self
+            .execution_semaphores
+            .lock()
+            .expect("execution semaphore map poisoned");
+        map.entry(env.to_string())
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_EXECUTIONS_PER_ENV,
+                ))
+            })
+            .clone()
+    }
+
+    /// Serialize a compiled module to bytes for AOT caching across restarts.
+    /// The bytes can be restored with `deserialize_module` on an engine with
+    /// an identical `Config` (same wasmtime 47, same GC/fuel/nan settings).
+    pub fn serialize_module(module: &Module) -> anyhow::Result<Vec<u8>> {
+        module
+            .serialize()
+            .map_err(|e| anyhow::anyhow!("Failed to serialize WASM module: {e}"))
+    }
+
+    /// Deserialize a previously serialized module. Safety: wasmtime requires
+    /// the bytes came from `Module::serialize` on a compatible engine; this
+    /// is `unsafe` in wasmtime's API because trusting arbitrary bytes would
+    /// break sandboxing.
+    pub fn deserialize_module(&self, bytes: &[u8]) -> anyhow::Result<Module> {
+        // Safety: bytes are assumed to be from `Module::serialize` with the
+        // same Config (wasmtime 47, wasm32-wasip1, nan/canonicalization etc).
+        // Callers must validate provenance; we re-validate imports via
+        // `validate_module` after deserialization where used.
+        let module = unsafe { Module::deserialize(&self.engine, bytes) }
+            .map_err(|e| anyhow::anyhow!("Failed to deserialize WASM module: {e}"))?;
+        Ok(module)
+    }
+
+    /// Insert a serialized module into the in-memory serialized cache keyed by
+    /// sha256. Useful for warming the cache from disk without recompilation.
+    pub fn cache_serialized(&self, sha256: [u8; 32], bytes: Vec<u8>) {
+        let mut cache = self
+            .serialized_cache
+            .lock()
+            .expect("serialized cache poisoned");
+        if cache.len() >= MAX_CACHED_MODULES {
+            cache.clear();
+        }
+        cache.insert(sha256, bytes);
+    }
+
+    /// Retrieve a cached serialized module, if present.
+    pub fn get_serialized(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {
+        self.serialized_cache
+            .lock()
+            .expect("serialized cache poisoned")
+            .get(sha256)
+            .cloned()
     }
 
     /// The engine backing this runner.
@@ -154,6 +238,22 @@ impl WasmRunner {
         {
             return Ok(module.clone());
         }
+        // AOT fast path: if we have a previously serialized module (from an
+        // earlier compile in this process or warmed from disk via
+        // `cache_serialized`), deserialize instead of recompiling.
+        if let Some(bytes) = self.get_serialized(&sha256) {
+            if let Ok(module) = unsafe { Module::deserialize(&self.engine, &bytes) } {
+                if validate_module(&module, limits).is_ok() {
+                    let module = Arc::new(module);
+                    let mut cache = self.module_cache.lock().expect("cache poisoned");
+                    if cache.len() >= MAX_CACHED_MODULES {
+                        cache.clear();
+                    }
+                    cache.insert(sha256, module.clone());
+                    return Ok(module);
+                }
+            }
+        }
         let _permit = self
             .compile_semaphore
             .acquire()
@@ -169,6 +269,20 @@ impl WasmRunner {
         {
             return Ok(module.clone());
         }
+        // Check serialized cache again after acquiring the permit.
+        if let Some(bytes) = self.get_serialized(&sha256) {
+            if let Ok(module) = unsafe { Module::deserialize(&self.engine, &bytes) } {
+                if validate_module(&module, limits).is_ok() {
+                    let module = Arc::new(module);
+                    let mut cache = self.module_cache.lock().expect("cache poisoned");
+                    if cache.len() >= MAX_CACHED_MODULES {
+                        cache.clear();
+                    }
+                    cache.insert(sha256, module.clone());
+                    return Ok(module);
+                }
+            }
+        }
         let engine = self.engine.clone();
         let module_binary = module_binary.to_vec();
         let compiled = tokio::time::timeout(
@@ -183,6 +297,13 @@ impl WasmRunner {
             )
         })?);
         validate_module(&module, limits)?;
+        // Populate the AOT serialized cache (best-effort). `Module::serialize`
+        // is deterministic for a given engine Config (wasmtime 47, nan
+        // canonicalization, GC settings) and avoids recompilation after a
+        // restart if the bytes are persisted to disk by the caller.
+        if let Ok(bytes) = module.serialize() {
+            self.cache_serialized(sha256, bytes);
+        }
         let mut cache = self.module_cache.lock().expect("cache poisoned");
         if cache.len() >= MAX_CACHED_MODULES {
             cache.clear();
@@ -630,11 +751,26 @@ pub(crate) async fn execute_module<RT: Runtime>(
 
 /// A function descriptor returned by a guest module's `__convex_functions`
 /// export.
+///
+/// Extended descriptor carries validator JSON (language-agnostic IR) so wasm
+/// guests converge to the same `AnalyzedFunction` rows as the isolate path:
+/// `[{name,type,args,returns,visibility}]` where `args`/`returns` are
+/// `Option<String>` validator JSON (`None` = unvalidated). Older guests that
+/// emit only `{name,type}` remain accepted via `Option` defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WasmFunctionDescriptor {
     pub name: String,
     #[serde(rename = "type")]
     pub function_type: String,
+    /// JSON-serialized `ConvexValidator` for args (Convex validator JSON)
+    #[serde(default)]
+    pub args: Option<String>,
+    /// JSON-serialized `ConvexValidator` for returns
+    #[serde(default)]
+    pub returns: Option<String>,
+    /// `"public"` | `"internal"` — mirrors `Visibility` / `FilterApi` partition
+    #[serde(default)]
+    pub visibility: Option<String>,
 }
 
 /// Parse the JSON array returned by a guest's `__convex_functions` export.

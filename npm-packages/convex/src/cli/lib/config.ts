@@ -19,6 +19,7 @@ import {
   BundleHash,
   bundle,
   bundleAuthConfig,
+  bundleWasmGuests,
   entryPointsByEnvironment,
 } from "../../bundler/index.js";
 import { version } from "../version.js";
@@ -672,6 +673,31 @@ export async function configFromProjectConfig(
   }
   const modules = convexResult.modules;
   modules.push(...nodeResult.modules);
+  // WASM guest modules (Rust, Kotlin, Go, C#, Dart) — stashed as base64 wasm
+  // alongside TS bundles. They share the same `path` namespace (`*.js`) so
+  // `doFinalComponentCodegen` merges them into one `fullApi`.
+  if (entryPoints.wasm.length > 0) {
+    if (verbose) {
+      logMessage(
+        "WASM runtime modules: ",
+        entryPoints.wasm.map((p) => path.relative(baseDir, p)),
+      );
+    }
+    const wasmBundles = await bundleWasmGuests(ctx, baseDir, entryPoints.wasm);
+    // Ensure no path collision between isolate/node and wasm logical paths
+    const seen = new Set(modules.map((m) => m.path));
+    for (const m of wasmBundles) {
+      if (seen.has(m.path)) {
+        return await ctx.crash({
+          exitCode: 1,
+          errorType: "invalid filesystem data",
+          printedMessage: `Duplicate module path "${m.path}" — a JS and a WASM guest would both produce the same logical module. Rename one.`,
+        });
+      }
+      seen.add(m.path);
+    }
+    modules.push(...wasmBundles);
+  }
   modules.push(...(await bundleAuthConfig(ctx, baseDir)));
 
   const nodeDependencies: NodeDependency[] = [];

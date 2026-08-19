@@ -152,7 +152,7 @@ fn build_zig_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
             "build-exe",
             "guest.zig",
             "-target",
-            "wasm32-wasi",
+            "wasm32-wasip1",
             "-mexec-model=reactor",
             "-O",
             "ReleaseSmall",

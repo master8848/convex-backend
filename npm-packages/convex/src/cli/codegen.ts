@@ -52,10 +52,20 @@ export const codegen = new Command("codegen")
     "--component-dir <path>",
     "Generate code for a specific component directory instead of the current application.",
   )
+  .addOption(
+    new Option(
+      "--lang <lang>",
+      "Target language for generated client API (default: typescript).",
+    )
+      .choices(["typescript", "kotlin", "rust", "csharp", "cs", "dart"] as const)
+      .default("typescript" as const),
+  )
   .action(async (options) => {
     const ctx = await oneoffContext(options);
     const deploymentSelection = await getDeploymentSelection(ctx, options);
 
+    const rawLang = (options as any).lang ?? "typescript";
+    const normalizedLang = rawLang === "cs" ? "csharp" : rawLang;
     const codegenOptions = {
       dryRun: !!options.dryRun,
       debug: !!options.debug,
@@ -69,6 +79,7 @@ export const codegen = new Command("codegen")
       systemUdfs: !!options.systemUdfs,
       largeIndexDeletionCheck: "no verification" as const, // `codegen` is a read-only operation
       codegenOnlyThisComponent: options.componentDir,
+      lang: normalizedLang,
     };
 
     if (options.systemUdfs) {

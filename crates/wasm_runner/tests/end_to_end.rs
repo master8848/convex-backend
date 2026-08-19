@@ -50,7 +50,15 @@ use wasm_runner::{
 fn build_go_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/go_guest",);
     let output = std::process::Command::new("go")
-        .args(["build", "-buildmode=c-shared", "-o", "go_guest.wasm", "."])
+        .args([
+            "build",
+            "-buildmode=c-shared",
+            "-ldflags=-s -w",
+            "-trimpath",
+            "-o",
+            "go_guest.wasm",
+            ".",
+        ])
         .current_dir(dir)
         .env("GOOS", "wasip1")
         .env("GOARCH", "wasm")
@@ -493,9 +501,16 @@ fn build_c_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
     let output = std::process::Command::new("clang")
         .args([
             "--target=wasm32-wasip1",
-            "-O3",
+            "-Oz",
+            "-flto",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fvisibility=hidden",
             "-nostdlib",
             "-Wl,--no-entry",
+            "-Wl,--gc-sections",
+            "-Wl,--icf=all",
+            "-Wl,--strip-all",
             "-Wl,--export=__convex_run",
             "-Wl,--export=__convex_functions",
             "-Wl,--allow-undefined",
@@ -600,12 +615,19 @@ fn build_cpp_guest_module() -> anyhow::Result<Option<Vec<u8>>> {
     let output = std::process::Command::new("clang++")
         .args([
             "--target=wasm32-wasip1",
-            "-O3",
+            "-Oz",
+            "-flto",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-fvisibility=hidden",
             "-nostdlib",
             "-fno-exceptions",
             "-fno-rtti",
             "-fno-threadsafe-statics",
             "-Wl,--no-entry",
+            "-Wl,--gc-sections",
+            "-Wl,--icf=all",
+            "-Wl,--strip-all",
             "-Wl,--export=__convex_run",
             "-Wl,--export=__convex_functions",
             "-Wl,--allow-undefined",

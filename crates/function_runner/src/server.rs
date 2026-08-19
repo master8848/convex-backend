@@ -845,3 +845,135 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use common::types::ModuleEnvironment;
+
+    use super::*;
+
+    fn is_wasm_only_env(envs: &[ModuleEnvironment]) -> bool {
+        !envs.is_empty() && envs.iter().all(|e| *e == ModuleEnvironment::Wasm)
+    }
+
+    #[test]
+    fn wasm_only_detection() {
+        // Mixed: one wasm, one isolate -> not wasm-only
+        assert!(!is_wasm_only_env(&[
+            ModuleEnvironment::Wasm,
+            ModuleEnvironment::Isolate
+        ]));
+        // Pure wasm: all wasm -> wasm-only
+        assert!(is_wasm_only_env(&[ModuleEnvironment::Wasm]));
+        assert!(is_wasm_only_env(&[
+            ModuleEnvironment::Wasm,
+            ModuleEnvironment::Wasm
+        ]));
+        // Empty -> not wasm-only (conservative)
+        assert!(!is_wasm_only_env(&[]));
+        // Isolate only -> not wasm-only
+        assert!(!is_wasm_only_env(&[ModuleEnvironment::Isolate]));
+    }
+
+    #[test]
+    fn wasm_only_skips_isolate_creation() {
+        use runtime::prod::ProdRuntime;
+
+        #[derive(Clone, Debug)]
+        struct DummyStorage;
+        #[async_trait::async_trait]
+        impl StorageForDeployment<ProdRuntime> for DummyStorage {
+            async fn storage_for_deployment(
+                &self,
+                _transaction: &mut database::Transaction<ProdRuntime>,
+                _use_case: storage::StorageUseCase,
+            ) -> anyhow::Result<Arc<dyn storage::Storage>> {
+                anyhow::bail!("not used in this test")
+            }
+        }
+
+        let tokio = ProdRuntime::init_tokio().unwrap();
+        let rt = ProdRuntime::new(&tokio);
+        // Construct a wasm-only core without calling _new(true) which would init V8.
+        // This proves the deployment path can be built without touching the JS engine.
+        let core: FunctionRunnerCore<ProdRuntime, DummyStorage> = FunctionRunnerCore {
+            rt: rt.clone(),
+            storage: DummyStorage,
+            index_cache: crate::in_memory_indexes::InMemoryIndexCache::new(rt.clone()),
+            module_cache: crate::module_cache::ModuleCache::new(rt.clone()),
+            code_cache: crate::module_cache::CodeCache::new(),
+            isolate_client: None,
+            wasm_runner: Arc::new(wasm_runner::WasmRunner::new().unwrap()),
+        };
+        // Wasm-only deployment: no isolate client, no V8 workers.
+        assert!(core.isolate_client.is_none());
+        assert_eq!(core.active_isolate_workers(), 0);
+        assert_eq!(core.max_isolate_workers(), 0);
+        let Err(err) = core.require_isolate_client() else {
+            panic!("expected JavaScriptExecutionDisabled error");
+        };
+        let err_str = err.to_string();
+        // ErrorMetadata code is JavaScriptExecutionDisabled; message mentions the knob.
+        assert!(
+            err_str.contains("ISOLATE_EXECUTION_ENABLED=false"),
+            "error should mention knob: {err_str}"
+        );
+        assert!(
+            err_str.contains("without the JavaScript engine"),
+            "expected wasm-only error, got: {err_str}"
+        );
+        // Also verify the ErrorMetadata short_msg when downcastable.
+        if let Some(meta) = err.downcast_ref::<errors::ErrorMetadata>() {
+            assert_eq!(meta.short_msg, "JavaScriptExecutionDisabled");
+        } else {
+            // Fallback: check via debug string if not downcastable due to anyhow wrapping.
+            assert!(
+                format!("{err:?}").contains("JavaScriptExecutionDisabled"),
+                "expected code in debug: {err:?}"
+            );
+        }
+
+        // Verify that _new(false) also produces None without V8 init.
+        let dummy_storage = DummyStorage;
+        let isolate_worker = isolate::isolate_worker::FunctionRunnerIsolateWorker::new(
+            rt.clone(),
+            isolate::IsolateConfig::new("test", isolate::ConcurrencyLimiter::unlimited()),
+        );
+        let core2 =
+            FunctionRunnerCore::_new(rt, dummy_storage, 100, isolate_worker, false).unwrap();
+        assert!(core2.isolate_client.is_none());
+        assert_eq!(core2.active_isolate_workers(), 0);
+    }
+
+    #[test]
+    fn mixed_deploy_has_isolate() {
+        use runtime::prod::ProdRuntime;
+
+        #[derive(Clone, Debug)]
+        struct DummyStorage;
+        #[async_trait::async_trait]
+        impl StorageForDeployment<ProdRuntime> for DummyStorage {
+            async fn storage_for_deployment(
+                &self,
+                _transaction: &mut database::Transaction<ProdRuntime>,
+                _use_case: storage::StorageUseCase,
+            ) -> anyhow::Result<Arc<dyn storage::Storage>> {
+                anyhow::bail!("not used in this test")
+            }
+        }
+
+        let tokio = ProdRuntime::init_tokio().unwrap();
+        let rt = ProdRuntime::new(&tokio);
+        let dummy_storage = DummyStorage;
+        let isolate_worker = isolate::isolate_worker::FunctionRunnerIsolateWorker::new(
+            rt.clone(),
+            isolate::IsolateConfig::new("test", isolate::ConcurrencyLimiter::unlimited()),
+        );
+        let core = FunctionRunnerCore::_new(rt, dummy_storage, 100, isolate_worker, true).unwrap();
+        assert!(core.isolate_client.is_some());
+        assert_eq!(core.max_isolate_workers(), 300);
+        assert!(core.require_isolate_client().is_ok());
+        // Explicitly shutdown to avoid leaking V8 workers in test.
+        drop(core);
+    }
+}

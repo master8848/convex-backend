@@ -9,6 +9,7 @@ name = "convex-local-backend"
 path = "src/main.rs"
 
 [features]
+sse = []
 testing = [
     "common/testing",
     "clusters/testing",
@@ -96,6 +97,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tungstenite = { workspace = true }
 udf = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 urlencoding = { workspace = true }
 usage_limits = { path = "../usage_limits" }
 usage_tracking = { path = "../usage_tracking" }

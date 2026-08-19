@@ -308,6 +308,18 @@ pub enum StateModification<V> {
         log_lines: LogLinesMessage,
         journal: SerializedQueryJournal,
     },
+    /// RFC6902 JSON-Patch delta for a query result. `patch` is a JSON
+    /// array (RFC6902) to be applied to the previous `value`'s packed
+    /// ConvexValue JSON. Language-agnostic: patch operates on the packed
+    /// `JsonPackedValue` JSON string, so any client that can apply
+    /// JSON-Patch (JS, Rust, Python via `jsonpatch`) can use it. Fallback
+    /// to `QueryUpdated` when patch would be larger than the threshold.
+    QueryPatched {
+        query_id: QueryId,
+        patch: JsonValue,
+        log_lines: LogLinesMessage,
+        journal: SerializedQueryJournal,
+    },
     QueryFailed {
         query_id: QueryId,
         error_message: String,

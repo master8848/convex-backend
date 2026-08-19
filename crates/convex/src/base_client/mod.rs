@@ -337,6 +337,37 @@ impl RemoteQuerySet {
                     self.remote_query_set
                         .insert(query_id, FunctionResult::Value(value));
                 },
+                StateModification::QueryPatched {
+                    query_id,
+                    patch,
+                    log_lines,
+                    journal: _,
+                } => {
+                    for log_line in log_lines.0 {
+                        convex_logs!("{}", log_line);
+                    }
+                    // Apply RFC6902 JSON-Patch to previous value's JSON.
+                    // Fallback to no-op if previous missing or patch apply fails
+                    // (server will resend full on next transition if needed).
+                    if let Some(existing) = self.remote_query_set.get(&query_id) {
+                        if let FunctionResult::Value(prev) = existing {
+                            let prev_json: serde_json::Value = prev.clone().into();
+                            if let Ok(patched) =
+                                apply_json_patch(&prev_json, &patch).and_then(|v| {
+                                    // Convert patched JsonValue back to Convex Value
+                                    v.try_into().map_err(|e| anyhow::anyhow!("{e:?}"))
+                                })
+                            {
+                                self.remote_query_set
+                                    .insert(query_id, FunctionResult::Value(patched));
+                                continue;
+                            }
+                        }
+                    }
+                    tracing::warn!(
+                        "Failed to apply QueryPatched for {query_id:?}, awaiting full value"
+                    );
+                },
                 StateModification::QueryFailed {
                     query_id,
                     error_message,
@@ -785,6 +816,151 @@ impl BaseConvexClient {
     fn local_query_result(&self, query_id: QueryId) -> Option<FunctionResult> {
         self.optimistic_query_results.query_result(query_id)
     }
+}
+
+fn apply_json_patch(
+    doc: &serde_json::Value,
+    patch: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let mut cur = doc.clone();
+    let ops = patch
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("patch not array"))?;
+    for op in ops {
+        let op_str = op
+            .get("op")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing op"))?;
+        let path = op
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing path"))?;
+        match op_str {
+            "add" | "replace" => {
+                let value = op
+                    .get("value")
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("missing value"))?;
+                json_patch_set(&mut cur, path, value, op_str == "add")?;
+            },
+            "remove" => json_patch_remove(&mut cur, path)?,
+            _ => anyhow::bail!("unsupported op {op_str}"),
+        }
+    }
+    Ok(cur)
+}
+
+fn json_patch_parse(path: &str) -> anyhow::Result<Vec<String>> {
+    if path.is_empty() {
+        return Ok(vec![]);
+    }
+    if !path.starts_with('/') {
+        anyhow::bail!("pointer must start with /");
+    }
+    Ok(path[1..]
+        .split('/')
+        .map(|t| t.replace("~1", "/").replace("~0", "~"))
+        .collect())
+}
+
+fn json_patch_set(
+    doc: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+    is_add: bool,
+) -> anyhow::Result<()> {
+    if path.is_empty() {
+        *doc = value;
+        return Ok(());
+    }
+    let tokens = json_patch_parse(path)?;
+    let mut cur = doc;
+    for (idx, token) in tokens.iter().enumerate() {
+        let is_last = idx == tokens.len() - 1;
+        if is_last {
+            match cur {
+                serde_json::Value::Object(map) => {
+                    map.insert(token.clone(), value);
+                    return Ok(());
+                },
+                serde_json::Value::Array(arr) => {
+                    let arr_idx: usize = token.parse()?;
+                    if is_add {
+                        if arr_idx > arr.len() {
+                            anyhow::bail!("add index out of bounds");
+                        }
+                        if arr_idx == arr.len() {
+                            arr.push(value);
+                        } else {
+                            arr.insert(arr_idx, value);
+                        }
+                    } else {
+                        if arr_idx >= arr.len() {
+                            anyhow::bail!("replace index out of bounds");
+                        }
+                        arr[arr_idx] = value;
+                    }
+                    return Ok(());
+                },
+                _ => anyhow::bail!("path through non-container"),
+            }
+        } else {
+            cur = match cur {
+                serde_json::Value::Object(map) => map
+                    .get_mut(token)
+                    .ok_or_else(|| anyhow::anyhow!("missing object key {token}"))?,
+                serde_json::Value::Array(arr) => {
+                    let arr_idx: usize = token.parse()?;
+                    arr.get_mut(arr_idx)
+                        .ok_or_else(|| anyhow::anyhow!("missing array index {arr_idx}"))?
+                },
+                _ => anyhow::bail!("path through non-container"),
+            };
+        }
+    }
+    Ok(())
+}
+
+fn json_patch_remove(doc: &mut serde_json::Value, path: &str) -> anyhow::Result<()> {
+    let tokens = json_patch_parse(path)?;
+    if tokens.is_empty() {
+        anyhow::bail!("cannot remove root");
+    }
+    let mut cur = doc;
+    for (idx, token) in tokens.iter().enumerate() {
+        let is_last = idx == tokens.len() - 1;
+        if is_last {
+            match cur {
+                serde_json::Value::Object(map) => {
+                    map.remove(token)
+                        .ok_or_else(|| anyhow::anyhow!("missing key"))?;
+                    return Ok(());
+                },
+                serde_json::Value::Array(arr) => {
+                    let arr_idx: usize = token.parse()?;
+                    if arr_idx >= arr.len() {
+                        anyhow::bail!("remove index out of bounds");
+                    }
+                    arr.remove(arr_idx);
+                    return Ok(());
+                },
+                _ => anyhow::bail!("remove through non-container"),
+            }
+        } else {
+            cur = match cur {
+                serde_json::Value::Object(map) => map
+                    .get_mut(token)
+                    .ok_or_else(|| anyhow::anyhow!("missing key"))?,
+                serde_json::Value::Array(arr) => {
+                    let arr_idx: usize = token.parse()?;
+                    arr.get_mut(arr_idx)
+                        .ok_or_else(|| anyhow::anyhow!("missing index"))?
+                },
+                _ => anyhow::bail!("path through non-container"),
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Macro used for piping UDF logs to a custom formatter that exposes
