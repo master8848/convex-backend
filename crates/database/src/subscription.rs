@@ -150,10 +150,8 @@ pub struct SubscriptionsClient {
     log: LogReader,
     senders: Vec<mpsc::Sender<SubscriptionRequest>>,
     next_manager: Arc<AtomicUsize>,
-    // Deduplicates identical subscriptions across all clients: many clients
-    // watching the same query share a single manager entry (one ReadSet, one
-    // interval-map footprint) instead of each keeping their own copy.
-    shared: Arc<Mutex<HashMap<DedupKey, Arc<SharedSubscriptionEntry>>>>,
+    // Dedup: many clients share one entry; ahash avoids DefaultHasher.
+    shared: Arc<Mutex<HashMap<DedupKey, Arc<SharedSubscriptionEntry>, ahash::RandomState>>>,
 }
 
 impl SubscriptionsClient {
@@ -328,7 +326,7 @@ struct SharedSubscriptionEntry {
     release_pending: Arc<AtomicBool>,
     invalid: Arc<AtomicBool>,
     release_tx: mpsc::Sender<SubscriptionRequest>,
-    shared: Arc<Mutex<HashMap<DedupKey, Arc<SharedSubscriptionEntry>>>>,
+    shared: Arc<Mutex<HashMap<DedupKey, Arc<SharedSubscriptionEntry>, ahash::RandomState>>>,
 }
 
 impl SharedSubscriptionEntry {
@@ -410,17 +408,11 @@ impl SharedSubscriptionEntry {
     }
 }
 
-/// A digest of a read set for deduplication. Not cryptographic; equal read
-/// sets hash equally because iteration order is deterministic.
-///
-/// Uses `fxhash::FxHasher` (deterministic, ~2× faster than `SipHasher13`
-/// behind `DefaultHasher`) because the digest is only used as a best-effort
-/// dedup key within a single process. Collisions are benign (missed dedup),
-/// and determinism across calls is required for the `(digest,ts,system)`
-/// map. `ahash` would also be viable; `FxHasher` was chosen for its
-/// zero-seed determinism.
+/// Digest of a read set for dedup. Not cryptographic; deterministic
+/// iteration order gives equal hash for equal sets. Uses `ahash::AHasher`
+/// (~2× faster than `DefaultHasher` SipHash) for non-adversarial dedup.
 fn reads_digest(reads: &ReadSet) -> u64 {
-    let mut hasher = fxhash::FxHasher::default();
+    let mut hasher = ahash::AHasher::default();
     for (index, index_reads) in reads.iter_indexed() {
         index.hash(&mut hasher);
         index_reads.fields.hash(&mut hasher);
@@ -518,7 +510,7 @@ impl SubscriptionsWorker {
             log: log_reader,
             senders,
             next_manager: Arc::new(AtomicUsize::new(0)),
-            shared: Arc::new(Mutex::new(HashMap::new())),
+            shared: Arc::new(Mutex::new(HashMap::default())),
         }
     }
 }

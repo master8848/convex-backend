@@ -418,13 +418,13 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                 // system-generated input.
                 let rng_seed = self.rt.rng().random();
                 let unix_timestamp = self.rt.unix_timestamp();
-                // Route WASM modules to the wasm runner before touching the
-                // isolate.
+                // Route WASM before isolate. Per-env semaphore (64, GC 64+32MiB).
                 if self
                     .module_environment(&mut transaction, path_and_args.path())
                     .await?
                     == ModuleEnvironment::Wasm
                 {
+                    let _permit = self.wasm_runner.execution_semaphore_for_env(&deployment_name).acquire_owned().await.context("WASM semaphore closed")?;
                     let (tx, outcome) = self
                         .execute_wasm_udf(
                             udf_type,
@@ -482,6 +482,7 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
                     .await?
                     == ModuleEnvironment::Wasm
                 {
+                    let _permit = self.wasm_runner.execution_semaphore_for_env(&deployment_name).acquire_owned().await.context("WASM semaphore closed")?;
                     let rng_seed = self.rt.rng().random();
                     let unix_timestamp = self.rt.unix_timestamp();
                     let (path, arguments, npm_version) = path_and_args.consume();

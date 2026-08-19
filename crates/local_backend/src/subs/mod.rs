@@ -379,24 +379,30 @@ pub const MAX_MESSAGE_SIZE: usize = 5_000_000;
 
 /// Shared helper: split a serialized Transition into TransitionChunk messages.
 /// WS (`run_sync_socket`) and SSE (`sse::sse_sync`) both call this so chunk
-/// boundaries and `transition_id` semantics stay identical. No duplicate
-/// transition logic; `sync_types::ServerMessage` remains the one wire format.
+/// boundaries and `transition_id` semantics stay identical. Uses `Bytes`
+/// zero-copy slicing (`Bytes::slice` is O(1) refcount) to avoid per-chunk
+/// `String` copies in `maybe_split_transition`.
 pub fn split_transition_into_chunks(
     transition_json: String,
     max_message_size: usize,
 ) -> Vec<ServerMessage> {
-    let mut chunks = Vec::new();
+    // `Bytes::from(String)` reuses the `String` allocation (no copy).
+    let bytes = bytes::Bytes::from(transition_json);
+    let s = std::str::from_utf8(&bytes).expect("Transition JSON is valid UTF-8");
+    let len = bytes.len();
+    let transition_id = len.to_string();
+    let mut chunks: Vec<bytes::Bytes> = Vec::new();
     let mut start = 0;
-    while start < transition_json.len() {
-        let mut end = (start + max_message_size).min(transition_json.len());
-        while end > start && !transition_json.is_char_boundary(end) {
+    while start < len {
+        let mut end = (start + max_message_size).min(len);
+        while end > start && !s.is_char_boundary(end) {
             end -= 1;
         }
-        chunks.push(transition_json[start..end].to_string());
+        // `slice` is zero-copy (Arc refcount bump).
+        chunks.push(bytes.slice(start..end));
         start = end;
     }
     let total_parts = chunks.len() as u32;
-    let transition_id = transition_json.len().to_string();
     chunks
         .into_iter()
         .enumerate()

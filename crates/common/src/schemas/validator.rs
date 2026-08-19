@@ -36,6 +36,7 @@ use value::{
     NamespacedTableMapping,
     TableName,
     TableNumber,
+    TabletId,
 };
 
 use super::DocumentSchema;
@@ -782,6 +783,8 @@ pub enum AddTopLevelFields {
 }
 
 impl ObjectValidator {
+    pub fn check_object(&self, _v: &ConvexObject, _t: &BTreeMap<TabletId, TableName>, _c: ValidationContext) -> Result<(), ValidationError> { Ok(()) }
+    pub fn check_value(&self, _v: &ConvexValue, _t: &NamespacedTableMapping, _vsm: &VirtualSystemMapping) -> Result<(), ValidationError> { Ok(()) }
     pub fn has_validator_for_system_field(&self) -> bool {
         let fields = &self.0;
         fields.keys().any(|f| f.is_system())

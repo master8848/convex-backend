@@ -719,13 +719,18 @@ impl<V: Into<JsonValue>> From<ServerMessage<V>> for JsonValue {
                 part_number,
                 total_parts,
                 transition_id,
-            } => json!({
-                "type": "TransitionChunk",
-                "chunk": chunk,
-                "partNumber": part_number,
-                "totalParts": total_parts,
-                "transitionId": transition_id,
-            }),
+            } => {
+                // `Bytes` is serialized as JSON string (UTF-8 chunk slice,
+                // zero-copy in `subs::maybe_split_transition`).
+                let chunk_str = String::from_utf8_lossy(&chunk).into_owned();
+                json!({
+                    "type": "TransitionChunk",
+                    "chunk": chunk_str,
+                    "partNumber": part_number,
+                    "totalParts": total_parts,
+                    "transitionId": transition_id,
+                })
+            },
             ServerMessage::FatalError { error_message } => json!({
                 "type": "FatalError",
                 "error": error_message,
@@ -883,7 +888,7 @@ impl<V: TryFrom<JsonValue, Error = anyhow::Error>> TryFrom<JsonValue> for Server
                 total_parts,
                 transition_id,
             } => ServerMessage::TransitionChunk {
-                chunk,
+                chunk: bytes::Bytes::from(chunk),
                 part_number,
                 total_parts,
                 transition_id,

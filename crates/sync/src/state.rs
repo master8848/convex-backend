@@ -87,8 +87,9 @@ pub struct SyncedQuery {
 
     /// Last successful packed value for delta encoding. When a query is
     /// re-executed and the new value differs only slightly, we can send a
-    /// RFC6902 JSON-Patch instead of the full value, gated by the
-    /// `maybe_patch` heuristic (size >1KB, patch <70% of full).
+    /// RFC6902 JSON-Patch instead of the full value, gated by
+    /// `patch::maybe_patch` (size >1KB, patch <0.8*value via
+    /// `is_patch_worth_it`).
     last_value: Option<JsonPackedValue>,
 
     /// Handle to the query's current invalidation future. This future completes
@@ -473,10 +474,9 @@ impl SyncState {
         } else {
             let modification = match result {
                 Ok(value) => {
-                    // Try delta encoding: if we have a previous value and the
-                    // new one is large, generate an RFC6902 patch. Patch is
-                    // language-agnostic (operates on packed JSON) and falls
-                    // back to full value when patch would be >70% of full.
+                    // Try delta encoding via `patch::maybe_patch`: emit
+                    // `QueryPatched` when `patch_bytes <0.8*value_bytes`
+                    // (`is_patch_worth_it`), else fallback to `QueryUpdated`.
                     let patch_opt = query
                         .last_value
                         .as_ref()

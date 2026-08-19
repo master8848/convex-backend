@@ -363,8 +363,10 @@ pub enum ServerMessage<V: 'static> {
         server_ts: Option<Timestamp>,
     },
     TransitionChunk {
-        /// The chunk of the serialized Transition message.
-        chunk: String,
+        /// The chunk of the serialized Transition message. Stored as `Bytes`
+        /// to allow zero-copy slicing in `subs::maybe_split_transition` without
+        /// per-chunk `String` copies; serialized as JSON string.
+        chunk: bytes::Bytes,
         /// 0-indexed part number.
         part_number: u32,
         /// Total number of parts for this transition.

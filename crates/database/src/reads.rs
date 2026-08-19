@@ -436,13 +436,22 @@ impl TransactionReadSet {
         system_tx_size: TransactionReadSize,
     ) {
         let (index_reads, search_reads) = reads.consume();
+        // Coalesce adjacent: delta may be < count due to IntervalSet::add.
+        let mut delta: isize = 0;
         for (index_name, index_reads) in index_reads {
-            self._record_indexed(index_name, index_reads.fields, index_reads.intervals);
+            let (before, after) =
+                self._record_indexed(index_name, index_reads.fields, index_reads.intervals);
+            delta += after as isize - before as isize;
         }
         for (index_name, search_reads) in search_reads {
             self.record_search(index_name, search_reads);
         }
-        self.num_intervals += num_intervals;
+        if delta >= 0 {
+            self.num_intervals = self.num_intervals.saturating_add(delta as usize);
+        } else {
+            self.num_intervals = self.num_intervals.saturating_sub((-delta) as usize);
+        }
+        let _ = num_intervals;
         self.user_tx_size += user_tx_size;
         self.system_tx_size += system_tx_size;
     }

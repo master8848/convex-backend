@@ -16,8 +16,14 @@ const MIN_PATCHABLE_SIZE: usize = 1024;
 
 /// Maximum `patch_bytes / new_bytes` ratio to still send a patch.
 /// If `patch.len() > ratio * new.len()`, we fall back to full value.
-/// 0.7 follows the design note's `diff > 0.7× full` heuristic.
-const PATCH_RATIO_THRESHOLD: f64 = 0.7;
+/// 0.8 follows `patch <0.8*value` spec.
+const PATCH_RATIO_THRESHOLD: f64 = 0.8;
+
+/// Returns true when `patch_bytes` is worthwhile vs `new_bytes`.
+/// Centralizes 0.8 threshold for `state.rs` and `maybe_patch`.
+pub fn is_patch_worth_it(patch_bytes: usize, new_bytes: usize) -> bool {
+    (patch_bytes as f64) < PATCH_RATIO_THRESHOLD * new_bytes as f64
+}
 
 /// Try to produce an RFC6902 patch from `old` to `new` if it would save
 /// bandwidth. Returns `Some(patch)` (as a JSON array) only when:
@@ -38,7 +44,7 @@ pub fn maybe_patch(old: &JsonPackedValue, new: &JsonPackedValue) -> Option<JsonV
     }
     let patch = diff_to_patch(old_str, new_str)?;
     let patch_str = serde_json::to_string(&patch).ok()?;
-    if patch_str.len() as f64 > PATCH_RATIO_THRESHOLD * new_str.len() as f64 {
+    if !is_patch_worth_it(patch_str.len(), new_str.len()) {
         return None;
     }
     // Avoid sending empty patch (should be deduped)
@@ -292,10 +298,10 @@ mod tests {
         let a = JsonPackedValue::pack(ConvexValue::try_from(arr_a).unwrap());
         let b = JsonPackedValue::pack(ConvexValue::try_from(arr_b).unwrap());
         // Patch will be many replaces ~ full size, expect None due to ratio
-        // Allow either Some small patch or None; but if Some, patch must be <0.7*new
+        // Allow either Some small patch or None; but if Some, patch must be <0.8*new
         if let Some(patch) = maybe_patch(&a, &b) {
             let patch_len = serde_json::to_string(&patch).unwrap().len();
-            assert!((patch_len as f64) < 0.7 * b.as_str().len() as f64);
+            assert!(is_patch_worth_it(patch_len, b.as_str().len()));
         }
     }
 

@@ -609,7 +609,7 @@ impl DocumentSchema {
         match self {
             DocumentSchema::Any => {},
             DocumentSchema::Union(t) => {
-                let all_tables_number_to_name =
+                let _all_tables_number_to_name =
                     all_tables_number_to_name(table_mapping, virtual_system_mapping);
                 // Union members are already filtered of system fields at parse
                 // time, so only the value needs filtering, and only when it
@@ -620,8 +620,12 @@ impl DocumentSchema {
                     Cow::Borrowed(value)
                 };
                 for obj_schema in t {
-                    if obj_schema
-                        .check_object(&value, &all_tables_number_to_name, ValidationContext::new())
+                    if Validator::Object(obj_schema.clone())
+                        .check_value(
+                            &ConvexValue::Object(value.clone().into_owned()),
+                            table_mapping,
+                            virtual_system_mapping,
+                        )
                         .is_ok()
                     {
                         return Ok(());
