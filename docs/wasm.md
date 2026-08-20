@@ -61,9 +61,10 @@ Rust/Go source ──compile──▶ wasm32-wasip1 module
                   - determinism: seeded ChaCha12 RNG, virtual clocks,
                     NaN canonicalization, relaxed SIMD disabled
                   - limits: memory cap (256 MiB), fuel (10B units),
-                    wall-clock timeout (30 s default)
+                    wall-clock timeout (30 s default), GC heap 64 MiB + 32 MiB growth (crates/wasm_runner/src/engine.rs:92)
                   - WASI p1 via add_to_linker_async (Rust std, Go runtime)
-                  - module compile cache keyed by sha256
+                  - module cache keyed by sha256: in-memory LRU (128) + AOT `Module::serialize`/`deserialize` (crates/wasm_runner/src/engine.rs:169)
+                  - per-env execution semaphore 64 (crates/wasm_runner/src/engine.rs:85, crates/function_runner/src/server.rs:423)
                                      │
                                      ▼
                   Transaction (real DB reads/writes, commit or abort)
@@ -87,14 +88,14 @@ The detailed table below covers the supported targets; the full status matrix (i
 | Rust | ✅ **valid target** | `wasm32-wasip1`, `cargo build` | `#[convex_functions]` + `#[query]`/`#[mutation]`/`#[action]` macros; example: `examples/wasm-guests/rust` |
 | Go | ✅ **valid target** | native Go `GOOS=wasip1 GOARCH=wasm -buildmode=c-shared` (Go ≥ 1.24) | `//go:wasmexport` + `//go:wasmimport`; `_initialize` called by the runner; example: `examples/wasm-guests/go` |
 | C | ✅ **valid target** | stock LLVM clang `--target=wasm32-wasip1 -nostdlib` | Freestanding guest (no libc, no WASI): smallest/fastest. Fixture `tests/fixtures/c_guest/guest.c` + end-to-end test; example: `examples/wasm-guests/c` |
-| C++ | ✅ **valid target** | stock LLVM clang++ `--target=wasm32-wasip1 -nostdlib -fno-exceptions -fno-rtti` | Same ABI as C; freestanding C++ rules in `examples/wasm-guests/cpp` (no libc++, no guard vars, POD statics). Serves game engines, Zig, AssemblyScript, Rust `no_std` |
+| C++ | ✅ **valid target** | stock LLVM clang++ `--target=wasm32-wasip1 -nostdlib -fno-exceptions -fno-rtti` | Same ABI as C; freestanding rules in `examples/wasm-guests/cpp` |
 | Dart / Flutter | ❌ **blocked upstream** | `dart compile wasm` → WasmGC | wasmtime 47 runs WasmGC modules under the runner's exact Config (`cargo run -p wasm_runner --example gc_spike`), but dart2wasm 3.12 emits legacy exception-handling instructions that wasmtime 47 rejects, and every module imports a JS host (`dart2wasm.*` helpers, `wasm:js-string` builtins, string-constant globals) with no standalone target in stable SDKs. Flutter mobile stays on Dart AOT native. See [dart-guest.md](dart-guest.md) |
 | Kotlin | ✅ fixture + e2e test (build gated on toolchain) | Kotlin Multiplatform `wasmWasi` (wasm32-wasip1 + WasmGC) | `@WasmExport` + `@WasmImport("env", ...)` give the exact ABI; reactor module (no `main`) self-initializes via the Wasm start section; imports only `wasi_snapshot_preview1` + `env`; needs JDK + Gradle to build (untested in CI). See [kotlin-guest.md](kotlin-guest.md) |
 | Zig | ✅ **valid target** | Zig 0.16+ `build-exe -target wasm32-wasi -mexec-model=reactor` | Smallest possible guest: freestanding reactor module, **zero WASI imports** (only the 4 `env` host functions), 394 B echo / 837 B args-parsing; Zig 0.16 needs explicit `--export=__convex_run --export=__convex_functions`. Fixture `tests/fixtures/zig_guest` + e2e test; example `examples/wasm-guests/zig`. See [zig-guest.md](zig-guest.md) |
 
-Go note: the runner calls `_initialize` before dispatch (required by the Go runtime) and registers WASI via `add_to_linker_async` so Go's runtime init (`fd_fdstat_get`, `poll_oneoff`, ...) does not hit wasmtime-wasi's blocking `in_tokio` path inside the async embedding.
+Go note: runner calls `_initialize` and registers WASI via `add_to_linker_async` to avoid the blocking `in_tokio` path.
 
-C note: the runner validates that modules import only `env` + WASI; a freestanding C guest imports only `env`, so it is the smallest and fastest guest (no runtime init, no GC, no WASI), on par with the Rust guest's single-digit-µs execution cost.
+C note: only `env` + WASI imports are allowed; freestanding C imports only `env` — smallest/fastest, single-digit-µs like Rust.
 
 ## Examples, scaffolding & best practices
 
@@ -103,7 +104,7 @@ C note: the runner validates that modules import only `env` + WASI; a freestandi
 - **Scaffold a new guest**: `examples/wasm-guests/scaffold.sh <lang> <name>` copies a pre-wired template (ABI imports/exports included).
 - **Best practices**: [wasm-best-practices.md](wasm-best-practices.md) — determinism, the host-allocated memory model, module shape, limits, the transaction model, testing, per-language notes, and a deployment checklist.
 
-The fixture + e2e + example requirement per language is recorded in the [guest language fixtures note](../.agents/notes/implemented/feature/2026-08-11-guest-language-fixtures-and-examples.md); the examples packaging, scaffold, and C++ freestanding rule in the [examples and best practices note](../.agents/notes/implemented/feature/2026-08-11-wasm-examples-and-best-practices.md).
+Per-language fixture + e2e + example requirement: [fixtures note](../.agents/notes/implemented/feature/2026-08-11-guest-language-fixtures-and-examples.md); packaging and C++ freestanding rule: [examples note](../.agents/notes/implemented/feature/2026-08-11-wasm-examples-and-best-practices.md).
 
 ## Verification
 
@@ -120,7 +121,9 @@ Rust WASM: echo (warm)      ~180 µs/call
 Go WASM: echo (warm)      ~2,160 µs/call   (Go guest 3.2 MB)
 ```
 
-The Rust WASM number includes transaction begin, wasmtime instantiation, host-function setup, execution, result parse, and teardown — the wasm execution itself is single-digit microseconds. Go is ~12× slower because a fresh `Store` per call runs the full Go runtime initialization (`_initialize`, GC setup). A freestanding C guest has no runtime init, so it lands at the Rust guest's end of the spectrum.
+Rust WASM number includes transaction, instantiation, host functions, execution, and teardown — wasm execution itself is single-digit µs. Go is ~12× slower due to per-call `_initialize` + GC setup; freestanding C has no init and matches Rust.
+
+Containerized idle/load RAM and `rps/p50/p95` under pinned `--cpus=2 --memory=2g` (cgroup, device-irrelevant, `docker stats` + `perf/load.js`): see [wasm containerized note](../.agents/notes/implemented/performance/2026-08-20-wasm-containerized-memory-cpu.md).
 
 ## Limitations
 
@@ -150,8 +153,8 @@ The Rust WASM number includes transaction begin, wasmtime instantiation, host-fu
 - **Deploy pipeline**: nothing writes a `.wasm` binary into a source package. The runtime seam expects the module's `source` to be base64 wasm; the bundler/CLI work to produce that is not done. JS bundling (`npm-packages/convex/src/bundler`) does not handle `.rs`/`.go` entry points.
 - **Analyze**: `FunctionRunnerCore::analyze` requires isolate modules; wasm modules need an analyze path that runs `__convex_functions` (the `analyze_functions` helper exists and is tested).
 - **Query cache**: no `QueryJournal` is produced, so wasm queries bypass incremental caching benefits (they still get full-function caching via `observed_time`/`observed_rng` flags).
-- **Compiled-module persistence**: `Module::serialize` (AOT caching across restarts) is not wired; modules are recompiled per process.
-- **Concurrency limits**: wasm executions do not share the application layer's per-environment semaphores.
+- **Compiled-module persistence**: `Module::serialize`/`deserialize` is wired as an in-process AOT cache keyed by sha256 (`crates/wasm_runner/src/engine.rs:107` `serialized_cache`, `cache_serialized`/`get_serialized`); modules are deserialized instead of recompiled when the bytes match the current engine `Config` (wasmtime 47, `crates/wasm_runner/src/engine.rs:169`). Cross-restart persistence to disk is caller-owned (the cache is warmable via `cache_serialized`).
+- **Concurrency limits**: wasm executions are bounded by a per-environment 64-permit semaphore (`crates/wasm_runner/src/engine.rs:85` `MAX_CONCURRENT_EXECUTIONS_PER_ENV`, `crates/wasm_runner/src/engine.rs:152` `execution_semaphore_for_env`) mirroring the isolate path's per-env limiting in `crates/isolate/src/concurrency_limiter.rs:109`; the limit is acquired in `crates/function_runner/src/server.rs:423`.
 - **Log streaming for actions**: `log_line_sender` is wired, but action progress log streaming through `log_action_progress` is untested for wasm.
 - **Go performance**: a per-module `Store` pool would avoid re-running the Go runtime `_initialize` per call.
 - **System UDFs / components**: system modules and component-scoped wasm functions are not supported (`deploy_config` rejects wasm in components).

@@ -45,6 +45,14 @@ Schema validation in `crates/common/src/schemas/` avoids re-parse and redundant 
 
 SQL filters evaluate against the document by reference: `Filter::next` (`crates/database/src/query/filter.rs`) does not deep-clone the document before evaluating the filter expression. `Expression::fold_constants` (`crates/common/src/query.rs`), applied at `Filter` construction, memoizes field-free subtrees — bare literals, literal arithmetic, comparisons of literals — into `Literal` nodes once, so they are not re-evaluated per row; subtrees that fail to evaluate stay unfolded so errors are still reported at eval time. SQLite prepares statements with `prepare_cached` instead of recompiling them per query.
 
+## 5. Request-lifecycle correct patterns
+
+The request pipeline `router/auth/dispatch/transaction/WriteLog/re-execution/sync` uses the correct data structure at each stage; rationale and rejected alternatives are recorded in the [request lifecycle perf note](../.agents/notes/implemented/performance/2026-08-19-request-lifecycle-perf-and-correct-patterns.md).
+
+- **Dispatch**: `ISOLATE_EXECUTION_ENABLED=false` never initializes V8 (`crates/common/src/knobs.rs:949`); the Wasm runner caps the WasmGC heap to 64 MiB reservation + 32 MiB growth (`crates/wasm_runner/src/engine.rs:92`) and AOT-caches compiled modules via `Module::serialize`/`deserialize` keyed by sha256 (`crates/wasm_runner/src/engine.rs:169`); per-environment execution is bounded by a 64-permit semaphore (`crates/wasm_runner/src/engine.rs:85` `MAX_CONCURRENT_EXECUTIONS_PER_ENV`, `function_runner/src/server.rs:423`) mirroring `crates/isolate/src/concurrency_limiter.rs:109`.
+- **Read path**: `Transaction { reads: TransactionReadSet, writes }` (`crates/database/src/transaction.rs:162`) records `ReadSet` per `TabletIndexName`; `SubscriptionManager` (`crates/database/src/subscription.rs:587`) stores `IntervalMap` per table with dedup `HashMap<DedupKey, AtomicUsize>` using `ahash` and coalesces adjacent `IntervalSet` on `record_indexed_directly`; `advance_log` advances a watermark incrementally instead of scanning the full log.
+- **Sync**: `StateModification::QueryUpdated` (`crates/convex/sync_types/src/types/mod.rs:341`) is emitted as RFC 6902 JSON-Patch (`crates/sync/src/patch.rs` `maybe_patch`, `is_patch_worth_it` 0.8 threshold, `MIN_PATCHABLE_SIZE` 1024) only when `patch < 0.8 * value`; otherwise the full `JsonPackedValue` is sent. `TransitionChunk` carries zero-copy `Bytes` and both WS (`crates/local_backend/src/subs/mod.rs:376`) and SSE (`crates/local_backend/src/subs/sse.rs:1`) share `SYNC_MAX_MESSAGE_SIZE` 5 MiB (`crates/common/src/knobs.rs:2041`) for chunking.
+
 ## Remaining serde-mediated conversions
 
 - `JsonPackedValue::unpack` on the sync/cache paths and `PendingValue::from_uncommitted_json` still convert through an intermediate `serde_json::Value`; they sit off the hottest per-document paths.
