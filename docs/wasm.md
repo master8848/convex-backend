@@ -123,7 +123,7 @@ Go WASM: echo (warm)      ~2,160 µs/call   (Go guest 3.2 MB)
 
 Rust WASM number includes transaction, instantiation, host functions, execution, and teardown — wasm execution itself is single-digit µs. Go is ~12× slower due to per-call `_initialize` + GC setup; freestanding C has no init and matches Rust.
 
-Containerized idle/load RAM and `rps/p50/p95` under pinned `--cpus=2 --memory=2g` (cgroup, device-irrelevant, `docker stats` + `perf/load.js`): see [wasm containerized note](../.agents/notes/implemented/performance/2026-08-20-wasm-containerized-memory-cpu.md).
+Containerized idle/load RAM and `rps/p50/p95` under pinned `--cpus=2 --memory=2g` (cgroup, device-irrelevant, `docker stats` + `perf/load.js`): see [wasm containerized note](../perf/2026-08-20-wasm-containerized-memory-cpu.md).
 
 ## Limitations
 

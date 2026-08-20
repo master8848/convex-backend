@@ -1,12 +1,12 @@
-# Agent Note: Containerized wasm-only vs baseline memory/CPU (OrbStack cgroup-pinned)
+# Containerized wasm-only vs baseline memory/CPU (OrbStack cgroup-pinned)
 
-Status: implemented
+> Measurement report — not an Agent Note. Canonical perf findings for `docs/wasm.md#benchmark-results` / `docs/wasm.md#deployment-modes`. Skill remains at `.agents/skills/convex-wasm-backend/SKILL.md`.
 
 ## Problem
 
 `docs/wasm.md#benchmark-results` reported in-process `udf_bench` per-call overhead (`~180µs` Rust warm, `~2160µs` Go) and `docs/wasm.md#deployment-modes` claimed wasm-only saves hundreds of MB by never initializing V8, but no containerized, device-irrelevant measurement existed. Host-dependent `ps` RSS varies by machine capacity and cargo cache, so claims were not reproducible across hosts. `perf/` in the demo repo staged a harness (`perf/bench.sh`, `perf/Dockerfile`, `perf/load.js`) to pin `--cpus=2 --memory=2g --memory-swap=2g` via OrbStack/Docker (`--context orbstack`, cgroup v2) and snapshot `docker stats --no-stream` idle/load, but no findings were recorded as a decision.
 
-## Decision
+## Method
 
 Add fixed-compute, device-irrelevant containerized measurement and record findings as the single home for the claim.
 
@@ -32,7 +32,7 @@ Wait `GET /version` health, settle 3s, `docker stats --no-stream --format "{{.Na
 - `wasm-only` idle `88.6 MiB` (`90768 KiB`) load `89.3 MiB`, `rps 2733.4 avg 3.28ms p50 2.09ms p95 7.08ms p99 9.67ms`
 - **delta**: idle `−14.6 MiB (−14%)`, load `−14.5 MiB`; `rps +10%` is noise — health path does not execute UDFs.
 
-Release delta is **hundreds of MB** at idle (eager `icudtl.dat` ~10.8MiB + UDF snapshot + V8 platform threads + per-isolate `64+32+64MiB` not initialized; see `crates/common/src/knobs.rs:ISOLATE_EXECUTION_ENABLED`, `crates/function_runner/src/server.rs:423` gate, `.agents/notes/implemented/architecture/2026-08-09-optional-js-engine-wasm-only.md`). Debug delta is smaller because `debug` binary and snapshot are larger and unoptimized; direction is consistent.
+Release delta is **hundreds of MB** at idle (eager `icudtl.dat` ~10.8MiB + UDF snapshot + V8 platform threads + per-isolate `64+32+64MiB` not initialized; see `crates/common/src/knobs.rs:ISOLATE_EXECUTION_ENABLED`, `crates/function_runner/src/server.rs:423` gate, `docs/wasm.md#deployment-modes`). Debug delta is smaller because `debug` binary and snapshot are larger and unoptimized; direction is consistent.
 
 **UDF overhead** — complementary in-process `cargo bench -p wasm_runner --bench udf_bench` (includes tx, instantiate, host functions, execution, teardown; not containerized) remains authoritative per `docs/wasm.md`: `native Rust ~0µs`, `Rust WASM warm ~180µs`, `Go WASM warm ~2160µs (3.2 MB)` ~12× due to per-call `_initialize` + GC setup, C/Zig freestanding single-digit µs matching Rust. No new `cargo bench` run was required; `docs/wasm.md` numbers already validated.
 
@@ -43,10 +43,17 @@ CSV columns match `perf/bench.sh`: `timestamp,mode,cpus,memory,mem_swap,requests
 - Host-only `ps` RSS without cgroups — rejected, values scale with host RAM/CPUs and cargo cache, not device-irrelevant.
 - Always build `rust:1.82-bookworm` inside Docker for every run — rejected, >5 min per run gates iteration; `bench.sh --no-build` reuse and lightweight native + cgroup probe is faster while still exercising the same limits and `docker stats` path.
 - `k6` or `crates/load_generator` scenario load for this decision — rejected for the required comparison: `health` mode isolates server overhead from deployment provision; scenario load is for follow-up UDF-specific `query`/`echo` modes.
-- Duplicating numbers into `docs/wasm.md` benchmark table — rejected per `.agents/notes/README.md` one-home-per-fact; `docs/wasm.md` now links here instead of duplicating, staying within 1800-word budget.
+- Duplicating numbers into `docs/wasm.md` benchmark table — rejected per `docs/AGENTS.md` one-home-per-fact; `docs/wasm.md` now links here instead of duplicating, staying within 1800-word budget.
 
-## Consequences
+## Consequences / Verification
 
-- Single home for containerized claim is this note; `docs/wasm.md#benchmark-results` links here with one line (budget 1769→~1781 words) rather than duplicating table; `demo-convex-backedn/perf/README.md` and `PERF_REPORT.md` link to this note for reproduction.
+- Single home for containerized claim is this file in `perf/`; `docs/wasm.md#benchmark-results` links here with one line rather than duplicating table; `demo-convex-backedn/perf/README.md` and `PERF_REPORT.md` link here for reproduction.
 - Verification: `docker --context orbstack info | head`, `docker --context orbstack ps`, probe `docker stats --no-stream` + `docker inspect -f '{{.HostConfig.Memory}}'` (cgroup `cpu.max`/`memory.max`), `node perf/load.js --mode health`, native `ps -o rss` for debug proxy; full container run via `./perf/bench.sh --both --requests 50 --concurrency 10` or `perf/docker-compose.yml` profile.
 - Follow-up: run `./perf/bench.sh --both` after a full release build to capture `docker stats` idle/load MemUsage in release (expected hundreds-of-MB delta) and append `perf/results/<timestamp>.md` with those `mem_limit_bytes=2147483648` rows.
+
+## References
+
+- `docs/wasm.md#deployment-modes` / `docs/wasm.md#benchmark-results`
+- `.agents/skills/convex-wasm-backend/SKILL.md` (how to write wasm backend, why better, limitations)
+- `crates/wasm_runner/benches/udf_bench.rs`, `crates/wasm_runner/src/engine.rs`, `crates/common/src/knobs.rs:ISOLATE_EXECUTION_ENABLED`
+- Demo harness: `demo-convex-backedn/perf/bench.sh`, `perf/Dockerfile`, `perf/load.js`, `perf/results/20260820-123024.*`
