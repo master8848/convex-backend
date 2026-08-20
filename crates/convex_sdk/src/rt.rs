@@ -63,6 +63,15 @@ pub struct FunctionDescriptor {
     /// "query", "mutation", "action", or "httpAction".
     #[serde(rename = "type")]
     pub function_type: &'static str,
+    /// JSON-serialized ConvexValidator for args (object validator). None = unvalidated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<&'static str>,
+    /// JSON-serialized ConvexValidator for returns. None = unvalidated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub returns: Option<&'static str>,
+    /// "public" or "internal". None defaults to public.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<&'static str>,
 }
 
 /// Run a wrapped function inside the generated `__convex_run` export.

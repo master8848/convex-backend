@@ -1,0 +1,7 @@
+# Gradle + Kotlin build output
+.gradle/
+build/
+.kotlin/
+
+# Compiled guest is generated
+*.wasm

@@ -727,16 +727,115 @@ impl<RT: Runtime, S: StorageForDeployment<RT>> FunctionRunnerCore<RT, S> {
         environment_variables: BTreeMap<EnvVarName, EnvVarValue>,
         deployment_name: String,
     ) -> anyhow::Result<Result<BTreeMap<CanonicalizedModulePath, AnalyzedModule>, JsError>> {
-        anyhow::ensure!(
-            modules
-                .values()
-                .all(|m| m.environment == ModuleEnvironment::Isolate),
-            "Can only analyze Isolate modules"
-        );
+        // Partition by environment — wasm guests are analyzed via wasm_runner
+        // (wasmtime 47) so they emit identical validator JSON IR as the isolate path
+        // and converge to the same AnalyzedFunction rows. See engine.rs:WasmFunctionDescriptor {args,returns,visibility}
+        // and npm codegen which consumes AnalyzedModule for ApiFromModules.
+        let (wasm_modules, isolate_modules): (BTreeMap<_, _>, BTreeMap<_, _>) = modules
+            .into_iter()
+            .partition(|(_, cfg)| is_wasm_environment(&cfg.environment));
 
-        self.require_isolate_client()?
-            .analyze(udf_config, modules, environment_variables, deployment_name)
+        // Analyze WASM modules via host-alloc ABI: decode base64 bundle, compile,
+        // call __convex_functions, parse WasmFunctionDescriptor -> AnalyzedFunction.
+        let mut analyzed: BTreeMap<CanonicalizedModulePath, AnalyzedModule> = BTreeMap::new();
+        for (path, cfg) in wasm_modules {
+            let wasm_bytes = match base64::decode(cfg.source.trim()) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Ok(Err(JsError::from_message(format!(
+                        "WASM module {} source is not valid base64: {e}",
+                        path.as_str()
+                    ))));
+                },
+            };
+            let descriptors = match wasm_runner::analyze_wasm_bytes(
+                &self.wasm_runner,
+                &wasm_bytes,
+                wasm_runner::WasmLimits::default(),
+            )
             .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    return Ok(Err(JsError::from_message(format!(
+                        "Failed to analyze WASM module {}: {e:#}",
+                        path.as_str()
+                    ))));
+                },
+            };
+            let mut functions = Vec::new();
+            for d in descriptors {
+                let name = match d.name.parse() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        return Ok(Err(JsError::from_message(format!(
+                            "Invalid function name {} in {}: {e}",
+                            d.name,
+                            path.as_str()
+                        ))));
+                    },
+                };
+                let udf_type = match d.function_type.parse() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return Ok(Err(JsError::from_message(format!(
+                            "Invalid function type {} in {}: {e}",
+                            d.function_type,
+                            path.as_str()
+                        ))));
+                    },
+                };
+                let visibility = match d.visibility.as_deref() {
+                    Some("public") => Some(model::modules::module_versions::Visibility::Public),
+                    Some("internal") => Some(model::modules::module_versions::Visibility::Internal),
+                    Some(other) => {
+                        return Ok(Err(JsError::from_message(format!(
+                            "Invalid visibility {other} for {} in {}",
+                            d.name,
+                            path.as_str()
+                        ))));
+                    },
+                    None => Some(model::modules::module_versions::Visibility::Public),
+                };
+                // args_str/returns_str are already ConvexValidator JSON strings (or None = unvalidated)
+                let func = model::modules::module_versions::AnalyzedFunction {
+                    name,
+                    pos: None,
+                    udf_type,
+                    visibility,
+                    args_str: d.args,
+                    returns_str: d.returns,
+                };
+                functions.push(func);
+            }
+            analyzed.insert(
+                path,
+                AnalyzedModule {
+                    functions: functions.into(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Analyze remaining Isolate modules via the V8 isolate path
+        if !isolate_modules.is_empty() {
+            let isolate_result = self
+                .require_isolate_client()?
+                .analyze(
+                    udf_config,
+                    isolate_modules,
+                    environment_variables,
+                    deployment_name,
+                )
+                .await?;
+            match isolate_result {
+                Ok(map) => {
+                    analyzed.extend(map);
+                },
+                Err(e) => return Ok(Err(e)),
+            }
+        }
+        Ok(Ok(analyzed))
     }
 
     #[fastrace::trace]

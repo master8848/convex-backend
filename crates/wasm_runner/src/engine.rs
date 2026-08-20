@@ -860,3 +860,82 @@ pub async fn analyze_functions<RT: Runtime>(
     let output = store.data().output.clone();
     parse_function_descriptors(output)
 }
+
+/// Analyze a WASM binary without needing a live Transaction. Used by
+/// `crates/function_runner/src/server.rs:analyze` to build AnalyzedModule
+/// rows from validator JSON (args/returns) emitted by the guest's
+/// `__convex_functions`. DB host functions are stubbed to `DB_ERROR` since
+/// analysis never touches the database.
+pub async fn analyze_wasm_bytes(
+    runner: &WasmRunner,
+    wasm_bytes: &[u8],
+    limits: WasmLimits,
+) -> anyhow::Result<Vec<WasmFunctionDescriptor>> {
+    let module = runner.get_or_compile_module(wasm_bytes, &limits).await?;
+    let call_data = Mutex::new(Vec::new());
+    let now = std::time::Duration::from_millis(0);
+    let mut wasi_builder = WasiCtxBuilder::new();
+    wasi_builder
+        .secure_random(DeterministicRng::from_seed([0u8; 32]))
+        .wall_clock(VirtualWallClock::new(now))
+        .monotonic_clock(VirtualMonotonicClock::new(now));
+    let context = HostContext {
+        wasi: wasi_builder.build_p1(),
+        input: Vec::new(),
+        call_data: Arc::new(call_data),
+        output: None,
+        error: None,
+        log_lines: Vec::new(),
+        rng: ChaCha12Rng::from_seed([0u8; 32]),
+        unix_timestamp_ms: 0,
+        observed_rng: false,
+        observed_time: false,
+        max_call_data: limits.max_call_data,
+        log_line_sender: None,
+        limits: StoreLimitsBuilder::new()
+            .memory_size(limits.max_memory_bytes as usize)
+            .instances(1)
+            .memories(1)
+            .tables(1)
+            .build(),
+    };
+    let mut store = Store::new(&runner.engine, context);
+    store.limiter(|state| &mut state.limits);
+    store.set_fuel(limits.fuel)?;
+    store.fuel_async_yield_interval(Some(1_000_000))?;
+    let mut linker = Linker::new(&runner.engine);
+    wasmtime_wasi::p1::add_to_linker_async(&mut linker, |state: &mut HostContext| &mut state.wasi)
+        .map_err(|e| anyhow::anyhow!("registering WASI: {e}"))?;
+    register_sync_host_functions(&mut linker)?;
+    // Stub DB host functions — analysis never calls DB; return DB_ERROR
+    for name in [DB_GET, DB_INSERT, DB_REPLACE, DB_PATCH, DB_DELETE, DB_COUNT, DB_QUERY] {
+        linker.func_wrap_async(
+            HOST_FN_MODULE,
+            name,
+            move |_caller: Caller<'_, HostContext>, (_ptr, _len): (i32, i32)| {
+                Box::new(async move { Ok(DB_ERROR) }) as Box<dyn std::future::Future<Output = Result<i64, wasmtime::Error>> + Send + '_>
+            },
+        )?;
+    }
+    let instance =
+        tokio::time::timeout(limits.timeout, linker.instantiate_async(&mut store, &module))
+            .await
+            .context("Timed out instantiating WASM module")??;
+    if let Ok(initialize) = instance.get_typed_func::<(), ()>(&mut store, INITIALIZE) {
+        tokio::time::timeout(limits.timeout, initialize.call_async(&mut store, ()))
+            .await
+            .context("Timed out initializing WASM module")?
+            .map_err(|e| anyhow::anyhow!("WASM module initialization failed: {e}"))?;
+    }
+    let functions: TypedFunc<(), i32> = instance
+        .get_typed_func(&mut store, GUEST_FUNCTIONS)
+        .map_err(|e| anyhow::anyhow!("Missing __convex_functions export: {e}"))?;
+    let status = tokio::time::timeout(limits.timeout, functions.call_async(&mut store, ()))
+        .await
+        .context("Timed out querying WASM module functions")??;
+    if status != RUN_OK {
+        anyhow::bail!("__convex_functions returned error status {status}");
+    }
+    let output = store.data().output.clone();
+    parse_function_descriptors(output)
+}

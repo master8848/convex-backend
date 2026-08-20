@@ -46,6 +46,7 @@ use common::{
 use database::Transaction;
 pub use engine::{
     analyze_functions,
+    analyze_wasm_bytes,
     WasmFunctionDescriptor,
     WasmRunner,
 };

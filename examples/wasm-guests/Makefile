@@ -3,8 +3,8 @@
 
 BUILD := build
 
-.PHONY: all rust go c cpp zig check clean
-all: rust go c cpp zig
+.PHONY: all rust go c cpp zig kotlin check clean
+all: rust go c cpp zig kotlin
 
 rust:
 	@mkdir -p $(BUILD)/rust
@@ -46,6 +46,13 @@ zig:
 	@mv zig/wasm_guest_example.wasm $(BUILD)/zig/
 	@echo "   ok: $(BUILD)/zig/wasm_guest_example.wasm  (tuned: wasip1 + ReleaseSmall + fstrip, 394-837B)"
 
+kotlin:
+	@mkdir -p $(BUILD)/kotlin
+	@echo ">> building kotlin example (requires JDK 11+ and Gradle 8.x)"
+	@cd kotlin && gradle build --console=plain --quiet
+	@find kotlin/build -name '*.wasm' -exec cp {} $(BUILD)/kotlin/ \;
+	@echo "   ok: $(BUILD)/kotlin/*.wasm (use wasm-tools print to verify imports: wasi_snapshot_preview1 + env)"
+
 # Report which toolchains are present and how to install the missing ones.
 check:
 	@echo "--- toolchain check ---"
@@ -56,7 +63,8 @@ check:
 	@if clang --target=wasm32-wasip1 -### -x c /dev/null 2>&1 | grep -q -- '--target=wasm32-wasip1'; then \
 		echo "clang(wasm): ok"; else echo "clang(wasm): MISSING (install LLVM clang, e.g. 'brew install llvm' — Apple clang lacks wasm targets)"; fi
 	@command -v dart >/dev/null && echo "dart:        ok (wasm GC guest: in progress)" || echo "dart:        not installed (needed for dart example once WasmGC lands)"
-	@command -v kotlinc >/dev/null && echo "kotlinc:     ok (wasmWasi guest: in progress)" || echo "kotlinc:     not installed (needed for kotlin example)"
+	@command -v gradle >/dev/null && echo "gradle:      ok ($$(gradle --version 2>/dev/null | grep Gradle | head -1))" || echo "gradle:      not installed (needed for kotlin example: Gradle 8.x + JDK 11+)"
+	@command -v kotlinc >/dev/null && echo "kotlinc:     ok (wasmWasi guest: valid target)" || echo "kotlinc:     not installed (needed for kotlin example)"
 	@command -v zig >/dev/null && echo "zig:         ok ($$(zig version))" || echo "zig:         MISSING (install zig: https://ziglang.org/download)")
 
 clean:

@@ -1,6 +1,6 @@
-// Kotlin Multiplatform wasmWasi Convex guest — now uses convex-kotlin-sdk (ConvexSdk.kt).
-// Target: wasm32-wasip1 + WasmGC (Kotlin 2.3.0). wasmtime 47 enables function-references, gc, exceptions.
-// Reactor module (no `main`) — start section initializes runtime. Uses kotlinx.serialization for JSON.
+// Kotlin guest example — ergonomic SDK (convex-kotlin-sdk).
+// Mirrors crates/wasm_runner/tests/fixtures/kotlin_guest but standalone.
+// Target: wasm32-wasip1 + WasmGC (Kotlin 2.3.0), reactor module (no `main`).
 @file:OptIn(org.jetbrains.kotlin.gradle.ExperimentalWasmDsl::class)
 
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
@@ -27,5 +27,10 @@ kotlin {
     }
 }
 
-// Single-command parity with Rust/Go/C: `gradle build` produces the .wasm under build/bin/wasmWasi/...;
-// `find build -name '*.wasm'` locates it (see tests/kotlin_guest_e2e.rs:find_kotlin_wasm).
+tasks.register<Copy>("copyWasm") {
+    dependsOn("build")
+    from(layout.buildDirectory.dir("bin/wasmWasi")) {
+        include("**/*.wasm")
+    }
+    into(layout.projectDirectory.dir("build"))
+}
